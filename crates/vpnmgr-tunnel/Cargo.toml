@@ -1,0 +1,15 @@
+[package]
+name = "vpnmgr-tunnel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vpnmgr-core.workspace = true
+defguard_wireguard_rs.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+vpnmgr-probe.workspace = true
+tokio.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "vpnmgrd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vpnmgr-core.workspace = true
+vpnmgr-probe.workspace = true
+vpnmgr-tunnel.workspace = true
+vpnmgr-ipc.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+thiserror.workspace = true

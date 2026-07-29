@@ -1,0 +1,45 @@
+[Unit]
+Description=vpnmgr WireGuard VPN manager
+Documentation=https://github.com/sunshine/vpn
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vpnmgrd --config /etc/vpnmgr/config.toml
+Restart=on-failure
+RestartSec=5
+
+# Creates /run/vpnmgr with the right mode; the daemon then chowns the socket
+# itself to root:vpnmgr 0660 so members of that group can drive it.
+RuntimeDirectory=vpnmgr
+RuntimeDirectoryMode=0750
+
+# The daemon manages network interfaces, routes and DNS, so it needs
+# CAP_NET_ADMIN. SETUID/SETGID are for dropping privileges when running
+# notify-send inside a user's session; without them notifications silently
+# fail. Everything else is dropped.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID
+NoNewPrivileges=yes
+
+# Filesystem hardening. Note this is deliberately not ProtectSystem=strict:
+# DNS is applied by shelling out to resolvconf (a symlink to resolvectl on
+# systemd systems), which needs a working /usr and D-Bus access to
+# systemd-resolved. Over-tightening here silently breaks DNS.
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/etc/vpnmgr
+PrivateTmp=yes
+ProtectKernelModules=no
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Keep the background footprint honest; the daemon idles well under this.
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

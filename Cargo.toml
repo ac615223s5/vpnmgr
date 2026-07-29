@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/vpnmgr-core",
+    "crates/vpnmgr-probe",
+    "crates/vpnmgr-tunnel",
+    "crates/vpnmgr-ipc",
+    "crates/vpnmgrd",
+    "crates/vpnmgr",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/sunshine/vpn"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
+tracing = "0.1"
+base64 = "0.22"
+# Pinned to boringtun's x25519-dalek 2.x: taking the key types from
+# boringtun's re-export avoids two incompatible curve25519 types in the tree.
+boringtun = { version = "0.7", default-features = false }
+socket2 = { version = "0.6", features = ["all"] }
+# Kernel WireGuard on Linux and WireGuard-NT on Windows behind one API.
+defguard_wireguard_rs = "0.11"
+vpnmgr-core = { path = "crates/vpnmgr-core" }
+vpnmgr-probe = { path = "crates/vpnmgr-probe" }
+vpnmgr-tunnel = { path = "crates/vpnmgr-tunnel" }
+vpnmgr-ipc = { path = "crates/vpnmgr-ipc" }
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
