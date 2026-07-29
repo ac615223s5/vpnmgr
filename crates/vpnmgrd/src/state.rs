@@ -49,6 +49,9 @@ pub struct State {
     tunnel: Option<LinuxTunnel>,
     current: Option<Connection>,
     last_sweep: Option<(SweepSummary, Instant)>,
+    /// Ranking from the most recent sweep, latency-ordered. Served to clients
+    /// that want good servers cheaply, without paying for a fresh sweep.
+    last_ranking: Vec<RankedServer>,
     /// A switch awaiting approval under `switch_policy = "ask"`.
     pending: Option<(RankedServer, String, Instant)>,
     /// The server the user was on when they last turned down a proposal, and
@@ -107,6 +110,7 @@ impl State {
             tunnel: None,
             current: None,
             last_sweep: None,
+            last_ranking: Vec::new(),
             pending: None,
             dismissed: None,
             last_tune: None,
@@ -229,7 +233,9 @@ impl State {
         }
 
         let _ = probe_settings;
-        Ok(ranked.iter().map(to_ranked).collect())
+        let ranking: Vec<RankedServer> = ranked.iter().map(to_ranked).collect();
+        self.last_ranking = ranking.clone();
+        Ok(ranking)
     }
 
     pub async fn connect(&mut self, server: Option<String>) -> Result<RankedServer> {
@@ -419,6 +425,15 @@ impl State {
             out.truncate(limit);
         }
         Ok(out)
+    }
+
+    /// The cached ranking from the last sweep, best first.
+    pub fn last_ranking(&self, limit: Option<usize>) -> Vec<RankedServer> {
+        let mut out = self.last_ranking.clone();
+        if let Some(limit) = limit {
+            out.truncate(limit);
+        }
+        out
     }
 
     pub fn is_connected(&self) -> bool {

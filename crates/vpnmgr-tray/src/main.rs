@@ -1,0 +1,594 @@
+//! `vpnmgr-tray` — a StatusNotifierItem tray for `vpnmgrd`.
+//!
+//! Unprivileged, like the CLI: everything it does is a request over the daemon
+//! socket. It exists so the auto-tuner's "ask before switching" policy has
+//! somewhere to ask that does not involve watching a terminal.
+//!
+//! # Structure
+//!
+//! Menu callbacks are synchronous and must not block — the tray would freeze
+//! for as long as a request took, and `connect` takes a fleet-wide sweep. So a
+//! click only pushes an [`Action`] onto a channel; a worker task performs the
+//! round trip and then refreshes the displayed state. A separate poller keeps
+//! the menu current when the daemon changes things on its own, which it does
+//! every time the scheduler runs.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use clap::Parser;
+use ksni::menu::{StandardItem, SubMenu};
+use ksni::{MenuItem, Status, ToolTip, Tray, TrayMethods};
+use tokio::sync::mpsc;
+use vpnmgr_ipc::{DEFAULT_SOCKET, RankedServer, Request, Response, ServerSummary, StatusReport};
+
+/// How often the daemon is polled. The daemon is the source of truth, and a
+/// scheduled tuning pass can change the connection with no involvement from us.
+const POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How many servers to offer under "Connect to". Enough to be useful without
+/// turning the menu into the full 250-server list.
+const QUICK_CONNECT_LIMIT: usize = 12;
+
+#[derive(Parser)]
+#[command(name = "vpnmgr-tray", about = "System tray for the WireGuard VPN manager", version)]
+struct Args {
+    /// Daemon socket.
+    #[arg(long, default_value = DEFAULT_SOCKET)]
+    socket: PathBuf,
+}
+
+/// A request raised by clicking a menu item.
+#[derive(Debug, Clone)]
+enum Action {
+    Connect(Option<String>),
+    Disconnect,
+    Autotune,
+    Approve,
+    Dismiss,
+    Quit,
+}
+
+/// Everything the tray draws from. Mutated only through `Handle::update`.
+struct VpnTray {
+    /// `None` when the daemon could not be reached.
+    status: Option<StatusReport>,
+    /// Latency-ordered servers from the daemon's last sweep. Preferred for
+    /// quick-connect, because offering the *lightest-loaded* servers first
+    /// recommends whichever ones happen to be idle — for a user in Toronto that
+    /// meant a menu of 135ms Uppsala servers presented as the best choices.
+    ranking: Vec<RankedServer>,
+    /// Load-ordered fallback, used until a sweep has run.
+    servers: Vec<ServerSummary>,
+    /// Why the last request failed, if it did.
+    error: Option<String>,
+    /// Why the daemon could not be reached. Kept separate from `error` and
+    /// shown in full: the usual cause is missing `vpnmgr` group membership,
+    /// which is invisible and unfixable from a tray that only says
+    /// "unreachable".
+    unreachable: Option<String>,
+    /// Set while a request is in flight, so the menu can say so instead of
+    /// looking unresponsive during a 12-second sweep.
+    busy: Option<String>,
+    actions: mpsc::UnboundedSender<Action>,
+}
+
+impl VpnTray {
+    fn new(actions: mpsc::UnboundedSender<Action>) -> Self {
+        Self {
+            status: None,
+            ranking: Vec::new(),
+            servers: Vec::new(),
+            error: None,
+            unreachable: None,
+            busy: None,
+            actions,
+        }
+    }
+
+    fn connected(&self) -> bool {
+        self.status.as_ref().is_some_and(|s| s.connected)
+    }
+
+    /// A pending proposal, or a connected-but-unhealthy tunnel, both want the
+    /// user's eye.
+    fn needs_attention(&self) -> bool {
+        self.status.as_ref().is_some_and(|s| {
+            s.pending_switch.is_some() || (s.connected && !s.healthy)
+        })
+    }
+
+    /// Queue an action. Failure means the worker is gone, i.e. we are exiting.
+    fn dispatch(&self, action: Action) {
+        if self.actions.send(action).is_err() {
+            tracing::debug!("action channel closed; ignoring the click");
+        }
+    }
+
+    /// `(server name, menu label)` for the quick-connect submenu.
+    ///
+    /// Measured latency when a sweep has produced a ranking, since that is what
+    /// makes a server a good choice. Falls back to the API's load figures before
+    /// the first sweep, labelled as load so the two are not confusable.
+    fn quick_connect_entries(&self) -> Vec<(String, String)> {
+        if !self.ranking.is_empty() {
+            return self
+                .ranking
+                .iter()
+                .take(QUICK_CONNECT_LIMIT)
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        format!(
+                            "{} — {} ({:.0}ms, {}% load)",
+                            s.name,
+                            truncate(&s.location, 22),
+                            s.rtt_ms,
+                            s.load
+                        ),
+                    )
+                })
+                .collect();
+        }
+        self.servers
+            .iter()
+            .take(QUICK_CONNECT_LIMIT)
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    format!(
+                        "{} — {} ({}% load)",
+                        s.name,
+                        truncate(&s.location, 24),
+                        s.load
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// The one-line summary used for both the tooltip and the menu header.
+    fn headline(&self) -> String {
+        match &self.status {
+            None => "vpnmgrd is not reachable".to_owned(),
+            Some(s) if !s.connected => "Disconnected".to_owned(),
+            Some(s) => format!(
+                "{} — {}",
+                s.server.as_deref().unwrap_or("?"),
+                s.location.as_deref().unwrap_or("?")
+            ),
+        }
+    }
+}
+
+impl Tray for VpnTray {
+    fn id(&self) -> String {
+        env!("CARGO_PKG_NAME").into()
+    }
+
+    fn title(&self) -> String {
+        "vpnmgr".into()
+    }
+
+    fn icon_name(&self) -> String {
+        // Stock freedesktop names, so this works without shipping an icon
+        // theme. `network-vpn` is the one that reliably exists.
+        match &self.status {
+            None => "network-offline".into(),
+            Some(s) if !s.connected => "network-offline".into(),
+            Some(s) if !s.healthy => "network-error".into(),
+            Some(_) => "network-vpn".into(),
+        }
+    }
+
+    fn status(&self) -> Status {
+        if self.needs_attention() {
+            Status::NeedsAttention
+        } else {
+            Status::Active
+        }
+    }
+
+    fn tool_tip(&self) -> ToolTip {
+        let mut description = String::new();
+        if let Some(s) = &self.status
+            && s.connected
+        {
+            description = format!(
+                "{}\nhandshake {}\n{} up, {} down",
+                s.endpoint
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no endpoint".into()),
+                match s.last_handshake_secs {
+                    Some(secs) => format!("{secs}s ago"),
+                    None => "never".to_owned(),
+                },
+                human_bytes(s.tx_bytes),
+                human_bytes(s.rx_bytes),
+            );
+        }
+        ToolTip {
+            icon_name: self.icon_name(),
+            title: self.headline(),
+            description,
+            ..Default::default()
+        }
+    }
+
+    fn menu(&self) -> Vec<MenuItem<Self>> {
+        let mut items = Vec::new();
+
+        items.push(disabled(self.headline()));
+
+        // Render the reason line by line. The IPC layer's messages carry the
+        // remedy on their own lines, and a menu cannot show embedded newlines.
+        if self.status.is_none()
+            && let Some(reason) = &self.unreachable
+        {
+            for line in reason.lines() {
+                // Wide enough that a remedy line stays a complete, copyable
+                // command rather than being cut mid-word.
+                items.push(disabled(format!("  {}", truncate(line.trim(), 90))));
+            }
+        }
+
+        if let Some(s) = &self.status
+            && s.connected
+        {
+            items.push(disabled(format!(
+                "entry {} · handshake {} · {}",
+                s.entry.unwrap_or(0),
+                match s.last_handshake_secs {
+                    Some(secs) => format!("{secs}s ago"),
+                    None => "never".to_owned(),
+                },
+                if s.healthy { "healthy" } else { "NO TRAFFIC" },
+            )));
+        }
+        if let Some(busy) = &self.busy {
+            items.push(disabled(format!("{busy}…")));
+        }
+        if let Some(error) = &self.error {
+            items.push(disabled(format!("error: {}", truncate(error, 60))));
+        }
+
+        // The pending proposal goes first, above the routine controls: it is
+        // the only thing here that is waiting on the user.
+        if let Some(pending) = self.status.as_ref().and_then(|s| s.pending_switch.as_ref()) {
+            items.push(MenuItem::Separator);
+            items.push(disabled(format!(
+                "Suggested: {} ({:.1}ms)",
+                pending.to.name, pending.to.rtt_ms
+            )));
+            let target = pending.to.name.clone();
+            items.push(
+                StandardItem {
+                    label: format!("Switch to {target}"),
+                    icon_name: "go-next".into(),
+                    activate: Box::new(|this: &mut Self| this.dispatch(Action::Approve)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(
+                StandardItem {
+                    label: "Keep current server".into(),
+                    activate: Box::new(|this: &mut Self| this.dispatch(Action::Dismiss)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        items.push(MenuItem::Separator);
+
+        let reachable = self.status.is_some();
+        // Offering actions that cannot possibly work is worse than hiding them.
+        let idle = self.busy.is_none() && reachable;
+
+        items.push(
+            StandardItem {
+                label: "Test now".into(),
+                icon_name: "view-refresh".into(),
+                enabled: reachable && idle,
+                activate: Box::new(|this: &mut Self| this.dispatch(Action::Autotune)),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        if self.connected() {
+            items.push(
+                StandardItem {
+                    label: "Disconnect".into(),
+                    icon_name: "network-offline".into(),
+                    enabled: idle,
+                    activate: Box::new(|this: &mut Self| this.dispatch(Action::Disconnect)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        } else {
+            items.push(
+                StandardItem {
+                    label: "Connect to best server".into(),
+                    icon_name: "network-vpn".into(),
+                    enabled: reachable && idle,
+                    activate: Box::new(|this: &mut Self| this.dispatch(Action::Connect(None))),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        let quick = self.quick_connect_entries();
+        if !quick.is_empty() {
+            let verb = if self.connected() {
+                "Switch to"
+            } else {
+                "Connect to"
+            };
+            let submenu = quick
+                .into_iter()
+                .map(|(name, label)| {
+                    StandardItem {
+                        label,
+                        enabled: idle,
+                        activate: Box::new(move |this: &mut Self| {
+                            this.dispatch(Action::Connect(Some(name.clone())))
+                        }),
+                        ..Default::default()
+                    }
+                    .into()
+                })
+                .collect();
+            items.push(
+                SubMenu {
+                    label: verb.into(),
+                    submenu,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        if let Some(tune) = self.status.as_ref().and_then(|s| s.last_tune.as_ref()) {
+            items.push(MenuItem::Separator);
+            items.push(disabled(truncate(tune, 70)));
+        }
+
+        items.push(MenuItem::Separator);
+        items.push(
+            StandardItem {
+                label: "Quit tray".into(),
+                icon_name: "application-exit".into(),
+                activate: Box::new(|this: &mut Self| this.dispatch(Action::Quit)),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        items
+    }
+}
+
+/// A non-interactive line of text in the menu.
+fn disabled(label: String) -> MenuItem<VpnTray> {
+    StandardItem {
+        label,
+        enabled: false,
+        ..Default::default()
+    }
+    .into()
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "vpnmgr_tray=info".into()),
+        )
+        .init();
+
+    let args = Args::parse();
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let handle = match VpnTray::new(tx).spawn().await {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!(
+                "could not register a tray icon: {e}\n\
+                 this needs a StatusNotifierItem host on the session bus \
+                 (KDE, or xapp-sn-watcher under Cinnamon, or the AppIndicator \
+                 extension under GNOME)"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // First paint before the poll loop's initial sleep, so the menu is
+    // populated by the time anyone can click it.
+    refresh(&handle, &args.socket).await;
+
+    let worker = tokio::spawn(run_actions(rx, handle.clone(), args.socket.clone()));
+
+    let poller = handle.clone();
+    let socket = args.socket.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            if poller.is_closed() {
+                return;
+            }
+            refresh(&poller, &socket).await;
+        }
+    });
+
+    // The worker returns when Quit is chosen.
+    let _ = worker.await;
+    handle.shutdown().await;
+}
+
+/// Perform queued actions one at a time, refreshing afterwards.
+///
+/// Serialising them is deliberate: the daemon holds one lock over its state, so
+/// firing a connect and a disconnect concurrently would only queue them there
+/// instead, with a less predictable order.
+async fn run_actions(
+    mut rx: mpsc::UnboundedReceiver<Action>,
+    handle: ksni::Handle<VpnTray>,
+    socket: PathBuf,
+) {
+    while let Some(action) = rx.recv().await {
+        if matches!(action, Action::Quit) {
+            return;
+        }
+
+        // Picking a named server means "switch" once a tunnel exists, because
+        // the daemon rejects connecting while already connected.
+        let connected = handle
+            .update(|tray| tray.connected())
+            .await
+            .unwrap_or(false);
+
+        let (request, busy) = match &action {
+            Action::Connect(None) => (Request::Connect { server: None }, "Finding the best server"),
+            Action::Connect(Some(server)) if connected => (
+                Request::Switch {
+                    server: server.clone(),
+                },
+                "Switching",
+            ),
+            Action::Connect(Some(server)) => (
+                Request::Connect {
+                    server: Some(server.clone()),
+                },
+                "Connecting",
+            ),
+            Action::Disconnect => (Request::Disconnect, "Disconnecting"),
+            Action::Autotune => (Request::Autotune, "Testing servers"),
+            Action::Approve => (Request::Approve, "Switching"),
+            Action::Dismiss => (Request::Dismiss, "Dismissing"),
+            Action::Quit => unreachable!("handled above"),
+        };
+
+        handle
+            .update(|tray| {
+                tray.busy = Some(busy.to_owned());
+                tray.error = None;
+            })
+            .await;
+
+        let outcome = vpnmgr_ipc::client::request(&socket, &request).await;
+        let error = match outcome {
+            Err(e) => Some(e.to_string()),
+            Ok(Response::Error { message }) => Some(message),
+            Ok(_) => None,
+        };
+        if let Some(error) = &error {
+            tracing::warn!("{request:?} failed: {error}");
+        }
+
+        handle
+            .update(|tray| {
+                tray.busy = None;
+                tray.error = error;
+            })
+            .await;
+
+        refresh(&handle, &socket).await;
+    }
+}
+
+/// Pull current state from the daemon into the tray.
+async fn refresh(handle: &ksni::Handle<VpnTray>, socket: &PathBuf) {
+    let (status, unreachable) = match vpnmgr_ipc::client::request(socket, &Request::Status).await {
+        Ok(Response::Status(report)) => (Some(*report), None),
+        Ok(Response::Error { message }) => {
+            tracing::debug!("daemon refused a status request: {message}");
+            (None, Some(message))
+        }
+        Ok(other) => {
+            tracing::debug!("unexpected reply to a status request: {other:?}");
+            (None, Some("vpnmgrd sent an unexpected reply".to_owned()))
+        }
+        Err(e) => {
+            tracing::debug!("could not reach the daemon: {e}");
+            (None, Some(e.to_string()))
+        }
+    };
+
+    // Only worth asking for server lists once the daemon is answering. The
+    // ranking is free (cached from the last sweep) and preferred; the load-
+    // ordered list is only needed as a fallback before any sweep has run.
+    let (ranking, servers) = if status.is_some() {
+        let ranking = match vpnmgr_ipc::client::request(
+            socket,
+            &Request::LastRanking {
+                limit: Some(QUICK_CONNECT_LIMIT),
+            },
+        )
+        .await
+        {
+            Ok(Response::Ranking(ranking)) => ranking,
+            _ => Vec::new(),
+        };
+
+        let servers = if ranking.is_empty() {
+            match vpnmgr_ipc::client::request(
+                socket,
+                &Request::Servers {
+                    country: None,
+                    limit: Some(QUICK_CONNECT_LIMIT),
+                },
+            )
+            .await
+            {
+                Ok(Response::Servers(servers)) => Some(servers),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        (Some(ranking), servers)
+    } else {
+        (None, None)
+    };
+
+    handle
+        .update(|tray| {
+            tray.status = status;
+            tray.unreachable = unreachable;
+            if let Some(ranking) = ranking {
+                tray.ranking = ranking;
+            }
+            if let Some(servers) = servers {
+                tray.servers = servers;
+            }
+        })
+        .await;
+}
+
+fn truncate(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        s.to_owned()
+    } else {
+        s.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}

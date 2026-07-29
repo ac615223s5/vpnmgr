@@ -1,0 +1,13 @@
+[package]
+name = "vpnmgr-tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vpnmgr-ipc.workspace = true
+ksni.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

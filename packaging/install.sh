@@ -27,6 +27,11 @@ cargo build --release
 echo "==> installing binaries into $PREFIX/bin"
 install -m 0755 target/release/vpnmgrd "$PREFIX/bin/vpnmgrd"
 install -m 0755 target/release/vpnmgr "$PREFIX/bin/vpnmgr"
+install -m 0755 target/release/vpnmgr-tray "$PREFIX/bin/vpnmgr-tray"
+
+echo "==> installing the tray autostart entry"
+install -d -m 0755 /etc/xdg/autostart
+install -m 0644 packaging/vpnmgr-tray.desktop /etc/xdg/autostart/vpnmgr-tray.desktop
 
 echo "==> creating group $GROUP"
 groupadd -f "$GROUP"
@@ -74,7 +79,12 @@ echo
 echo "Done. Add yourself to the '$GROUP' group, then log out and back in:"
 echo "    sudo usermod -aG $GROUP \$USER"
 echo
+echo "The log out matters: group membership is fixed at login, so until then"
+echo "every client -- including the tray -- will be refused by the socket."
+echo
 echo "Then try:"
 echo "    vpnmgr status"
 echo "    vpnmgr test --country ca"
 echo "    vpnmgr connect"
+echo
+echo "The tray starts automatically at next login, or run vpnmgr-tray now."

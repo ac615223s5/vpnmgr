@@ -7,6 +7,7 @@ members = [
     "crates/vpnmgr-ipc",
     "crates/vpnmgrd",
     "crates/vpnmgr",
+    "crates/vpnmgr-tray",
 ]
 
 [workspace.package]
@@ -37,6 +38,9 @@ vpnmgr-ipc = { path = "crates/vpnmgr-ipc" }
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
+# StatusNotifierItem tray. Works under Cinnamon via xapp-sn-watcher, and
+# under KDE/GNOME-with-AppIndicator, without linking any GUI toolkit.
+ksni = "0.3"
 
 [profile.release]
 opt-level = "z"

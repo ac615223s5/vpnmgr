@@ -39,6 +39,12 @@ pub enum Request {
     Switch { server: String },
     /// Run a probe sweep and return the ranking without connecting.
     Test { country: Option<String> },
+    /// The ranking from the most recent sweep, without probing again.
+    ///
+    /// Distinct from [`Request::Test`], which costs a full fleet sweep. This is
+    /// for callers that want latency-ordered servers cheaply and often — a tray
+    /// menu redrawn every few seconds cannot afford to probe.
+    LastRanking { limit: Option<usize> },
     /// List known servers from the cached API data. Does not probe.
     Servers {
         country: Option<String>,
@@ -275,6 +281,8 @@ mod tests {
             country: None,
             limit: Some(10),
         });
+        roundtrip(Request::LastRanking { limit: Some(12) });
+        roundtrip(Request::LastRanking { limit: None });
         roundtrip(Request::Reload);
         roundtrip(Request::Version);
         roundtrip(Request::Autotune);

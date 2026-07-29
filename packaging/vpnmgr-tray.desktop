@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=vpnmgr tray
+Comment=VPN status and server switching in the system tray
+Exec=/usr/local/bin/vpnmgr-tray
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+# Only meaningful where a StatusNotifierItem host exists. Under Cinnamon that
+# is xapp-sn-watcher, under KDE the panel itself, and under GNOME the
+# AppIndicator extension. Without one the tray exits with a message rather
+# than lingering invisibly.
+OnlyShowIn=KDE;X-Cinnamon;GNOME;MATE;XFCE;LXQt;
+X-GNOME-Autostart-enabled=true
+# The tray is unprivileged and talks to vpnmgrd over its socket, so it needs
+# the user to be in the vpnmgr group. Starting it before the session is up
+# would only fail its first poll, which it recovers from.
+X-GNOME-Autostart-Delay=3

@@ -51,6 +51,12 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Show the ranking from the last sweep without probing again.
+    Ranking {
+        /// How many results to show.
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+    },
     /// Re-read the daemon's configuration file.
     Reload,
     /// Run a tuning pass now rather than waiting for the schedule.
@@ -94,6 +100,9 @@ async fn main() -> ExitCode {
             country: country.clone(),
             limit: *limit,
         },
+        Command::Ranking { limit } => Request::LastRanking {
+            limit: Some(*limit),
+        },
         Command::Reload => Request::Reload,
         Command::Autotune => Request::Autotune,
         Command::Approve => Request::Approve,
@@ -128,9 +137,13 @@ async fn main() -> ExitCode {
         }
         Response::Ranking(ranking) => {
             let limit = match args.command {
-                Command::Test { limit, .. } => limit,
+                Command::Test { limit, .. } | Command::Ranking { limit } => limit,
                 _ => ranking.len(),
             };
+            if ranking.is_empty() {
+                println!("no sweep has run yet; try `vpnmgr test`");
+                return ExitCode::SUCCESS;
+            }
             print_ranking(&ranking, limit);
             ExitCode::SUCCESS
         }
