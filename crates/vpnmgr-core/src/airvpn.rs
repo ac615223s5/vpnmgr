@@ -247,11 +247,7 @@ mod tests {
     #[test]
     fn unhealthy_servers_carry_a_warning() {
         let list = fixture();
-        let sick: Vec<_> = list
-            .servers
-            .iter()
-            .filter(|s| !s.is_healthy())
-            .collect();
+        let sick: Vec<_> = list.servers.iter().filter(|s| !s.is_healthy()).collect();
         assert_eq!(sick.len(), 14);
         assert!(sick.iter().all(|s| s.warning.is_some()));
     }
@@ -271,11 +267,7 @@ mod tests {
     #[test]
     fn headroom_is_never_more_than_the_provisioned_capacity() {
         let list = fixture();
-        assert!(
-            list.servers
-                .iter()
-                .all(|s| s.headroom_mbps() <= s.bw_max)
-        );
+        assert!(list.servers.iter().all(|s| s.headroom_mbps() <= s.bw_max));
     }
 
     /// The reason headroom replaced the spare-bandwidth *fraction*: servers at

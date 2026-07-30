@@ -245,10 +245,7 @@ mod tests {
                 .take(2)
                 .collect()
         };
-        let measured = vec![
-            measured(pair[0], ms(90)),
-            measured(pair[1], ms(12)),
-        ];
+        let measured = vec![measured(pair[0], ms(90)), measured(pair[1], ms(12))];
         let ranked = rank(&measured, &Scoring::default());
         assert_eq!(ranked[0].server.name, pair[1].name);
     }
@@ -330,7 +327,8 @@ mod tests {
         let measured = vec![measured(light, ms(28)), measured(heavy, ms(6))];
         let ranked = rank(&measured, &Scoring::default());
         assert_eq!(
-            ranked[0].server.name, heavy.name,
+            ranked[0].server.name,
+            heavy.name,
             "a 4.5x latency advantage should beat a {}-point load gap",
             heavy.load - light.load
         );
@@ -393,7 +391,8 @@ mod tests {
         };
         for server in [servers[0], servers[1]] {
             assert!(
-                (score_of(&pair, &server.name) - score_of(&with_outlier, &server.name)).abs() < 1e-12,
+                (score_of(&pair, &server.name) - score_of(&with_outlier, &server.name)).abs()
+                    < 1e-12,
                 "{} moved when an unrelated slow server joined the set",
                 server.name
             );
@@ -429,7 +428,10 @@ mod tests {
             (first_doubling - later_doubling).abs() < 1e-9,
             "1x->2x cost {first_doubling:.4} but 10x->20x cost {later_doubling:.4}"
         );
-        assert!(first_doubling > 0.2, "a doubling should be clearly penalised");
+        assert!(
+            first_doubling > 0.2,
+            "a doubling should be clearly penalised"
+        );
     }
 
     /// Capacity is scored as absolute headroom, and deliberately capped: past
@@ -483,7 +485,10 @@ mod tests {
             .iter()
             .max_by_key(|s| s.headroom_mbps())
             .expect("fixture has servers");
-        assert!(scarce.headroom_mbps() < 1000, "expected a server short of room");
+        assert!(
+            scarce.headroom_mbps() < 1000,
+            "expected a server short of room"
+        );
 
         let ranked = rank(
             &[measured(scarce, ms(10)), measured(ample, ms(10))],
@@ -518,14 +523,17 @@ mod tests {
                 &[measured(server, ms(10))],
                 &Scoring::new(Weights::default(), target),
             )[0]
-                .headroom_score
+            .headroom_score
         };
         // A modest target is easily satisfied; a demanding one is not.
         assert!(
             head(200.0) > head(4000.0),
             "a server should look better to someone who needs less from it"
         );
-        assert!(head(200.0) >= 0.99, "well past the target should be full marks");
+        assert!(
+            head(200.0) >= 0.99,
+            "well past the target should be full marks"
+        );
     }
 
     /// Log-shaped like latency: the first slice of spare capacity is worth more
@@ -545,7 +553,7 @@ mod tests {
                 &[measured(server, ms(10))],
                 &Scoring::new(Weights::default(), target),
             )[0]
-                .headroom_score
+            .headroom_score
         };
         // Headroom at a quarter of target already earns well over a quarter of
         // the score; that concavity is the whole point of the log.
@@ -572,7 +580,7 @@ mod tests {
                 &[measured(full, ms(10))],
                 &Scoring::new(Weights::default(), target),
             )[0]
-                .headroom_score;
+            .headroom_score;
             assert_eq!(score, 0.0, "target {target} gave {score}");
         }
     }
@@ -584,10 +592,7 @@ mod tests {
         healthy.sort_by_key(|s| s.load);
         let (light, heavy) = (healthy[0], healthy[healthy.len() - 1]);
         assert!(light.load < heavy.load);
-        let measured = vec![
-            measured(heavy, ms(25)),
-            measured(light, ms(25)),
-        ];
+        let measured = vec![measured(heavy, ms(25)), measured(light, ms(25))];
         let ranked = rank(&measured, &Scoring::default());
         assert_eq!(ranked[0].server.name, light.name);
     }
@@ -600,13 +605,14 @@ mod tests {
         let (light, heavy) = (healthy[0], healthy[healthy.len() - 1]);
         // Ignore load entirely: the slower-but-lighter server should lose.
         let rtt_only = Scoring::new(
-            Weights { rtt: 1.0, load: 0.0, headroom: 0.0 },
+            Weights {
+                rtt: 1.0,
+                load: 0.0,
+                headroom: 0.0,
+            },
             Scoring::default().headroom_target_mbps,
         );
-        let measured = vec![
-            measured(light, ms(200)),
-            measured(heavy, ms(10)),
-        ];
+        let measured = vec![measured(light, ms(200)), measured(heavy, ms(10))];
         let ranked = rank(&measured, &rtt_only);
         assert_eq!(ranked[0].server.name, heavy.name);
     }

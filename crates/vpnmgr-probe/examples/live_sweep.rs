@@ -17,14 +17,20 @@ use vpnmgr_probe::{Prober, sweep};
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let conf = args.next().expect("usage: live_sweep <conf> [country_code]");
+    let conf = args
+        .next()
+        .expect("usage: live_sweep <conf> [country_code]");
     let country = args.next();
 
     let client = ClientConfig::import(&conf).expect("config should parse");
     println!("fleet key matches: {}", client.matches_known_airvpn_key());
 
     let list = Client::new().unwrap().fetch().await.expect("fetch servers");
-    println!("fetched {} servers ({} healthy)", list.servers.len(), list.healthy_count());
+    println!(
+        "fetched {} servers ({} healthy)",
+        list.servers.len(),
+        list.healthy_count()
+    );
 
     let filters = Filters {
         country_whitelist: country.iter().cloned().collect(),

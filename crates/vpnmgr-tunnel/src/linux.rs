@@ -32,7 +32,8 @@ pub struct LinuxTunnel {
 impl LinuxTunnel {
     pub fn new(interface: impl Into<String>) -> Result<Self> {
         let interface = interface.into();
-        let api = WGApi::<Kernel>::new(interface.clone()).map_err(|e| wg_err("open", &interface, e))?;
+        let api =
+            WGApi::<Kernel>::new(interface.clone()).map_err(|e| wg_err("open", &interface, e))?;
         Ok(Self {
             api,
             interface,

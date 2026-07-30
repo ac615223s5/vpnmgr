@@ -289,5 +289,4 @@ mod tests {
         let hint = Killswitch::recovery_hint();
         assert!(hint.contains("nft delete table inet vpnmgr"));
     }
-
 }

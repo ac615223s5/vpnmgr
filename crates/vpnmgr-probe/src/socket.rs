@@ -40,8 +40,10 @@ fn bind_marked(bind_addr: SocketAddr, fwmark: Option<u32>) -> io::Result<UdpSock
         socket.set_mark(mark).map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("setting fwmark {mark} on the probe socket failed \
-                         (needs CAP_NET_ADMIN): {e}"),
+                format!(
+                    "setting fwmark {mark} on the probe socket failed \
+                         (needs CAP_NET_ADMIN): {e}"
+                ),
             )
         })?;
     }
@@ -83,7 +85,10 @@ mod tests {
     async fn each_probe_gets_a_distinct_source_port() {
         let a = bind_for("1.2.3.4:1637".parse().unwrap(), None).unwrap();
         let b = bind_for("1.2.3.4:1637".parse().unwrap(), None).unwrap();
-        assert_ne!(a.local_addr().unwrap().port(), b.local_addr().unwrap().port());
+        assert_ne!(
+            a.local_addr().unwrap().port(),
+            b.local_addr().unwrap().port()
+        );
     }
 
     #[cfg(target_os = "linux")]

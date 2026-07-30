@@ -238,12 +238,9 @@ impl Prober {
 
     /// One handshake. `Ok` carries the RTT, `Err` an outcome describing why
     /// no timing was obtained.
-    async fn one_handshake(
-        &self,
-        endpoint: SocketAddr,
-    ) -> Result<(Duration, Outcome), Outcome> {
-        let socket = socket::bind_for(endpoint, self.fwmark)
-            .map_err(|e| Outcome::Failed(e.to_string()))?;
+    async fn one_handshake(&self, endpoint: SocketAddr) -> Result<(Duration, Outcome), Outcome> {
+        let socket =
+            socket::bind_for(endpoint, self.fwmark).map_err(|e| Outcome::Failed(e.to_string()))?;
 
         let index = self.index.fetch_add(1, Ordering::Relaxed);
         let mut tunn = Tunn::new(
@@ -406,12 +403,8 @@ mod tests {
     use super::*;
     use vpnmgr_core::airvpn::{self, ServerList};
 
-    const SAMPLE_CONF: &str = include_str!(
-        "../../vpnmgr-core/tests/fixtures/airvpn_sample.conf"
-    );
-    const STATUS: &str = include_str!(
-        "../../vpnmgr-core/tests/fixtures/airvpn_status.json"
-    );
+    const SAMPLE_CONF: &str = include_str!("../../vpnmgr-core/tests/fixtures/airvpn_sample.conf");
+    const STATUS: &str = include_str!("../../vpnmgr-core/tests/fixtures/airvpn_status.json");
 
     fn client() -> ClientConfig {
         ClientConfig::parse(SAMPLE_CONF, "sample.conf").unwrap()
@@ -431,7 +424,10 @@ mod tests {
 
     #[test]
     fn median_of_one_sample_is_that_sample() {
-        assert_eq!(median(&[Duration::from_millis(7)]), Some(Duration::from_millis(7)));
+        assert_eq!(
+            median(&[Duration::from_millis(7)]),
+            Some(Duration::from_millis(7))
+        );
     }
 
     #[test]
@@ -481,7 +477,11 @@ mod tests {
         let result = prober().probe(addr).await;
         assert_eq!(result.outcome, Outcome::Unreachable);
         // Must respect the configured timeout rather than blocking.
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -613,7 +613,9 @@ mod tests {
         assert!(measured.iter().all(|m| m.rtt.is_none()));
         // An endpoint is still populated so callers never see a hole.
         assert!(measured.iter().all(|m| m.endpoint.port() == 9));
-        assert!(vpnmgr_core::score::rank(&measured, &vpnmgr_core::score::Scoring::default()).is_empty());
+        assert!(
+            vpnmgr_core::score::rank(&measured, &vpnmgr_core::score::Scoring::default()).is_empty()
+        );
     }
 
     #[test]

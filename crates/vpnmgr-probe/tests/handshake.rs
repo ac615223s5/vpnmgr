@@ -43,7 +43,11 @@ fn base64_of(bytes: [u8; 32]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -123,7 +127,11 @@ async fn completes_a_real_handshake_and_measures_a_round_trip() {
         "a valid handshake should verify: {:?}",
         result.outcome
     );
-    assert_eq!(result.samples.len(), 3, "every sample should have succeeded");
+    assert_eq!(
+        result.samples.len(),
+        3,
+        "every sample should have succeeded"
+    );
     let rtt = result.rtt.expect("a completed handshake yields an RTT");
     // Loopback: real, non-zero, and far below the timeout.
     assert!(rtt > Duration::ZERO);

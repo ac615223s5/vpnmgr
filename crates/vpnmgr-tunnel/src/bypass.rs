@@ -174,7 +174,11 @@ impl Bypass {
     /// Withdraw every route we installed. Safe to call more than once.
     pub fn remove(&mut self) {
         for route in self.installed.drain(..) {
-            let args = vec!["route".to_owned(), "del".to_owned(), route.destination.clone()];
+            let args = vec![
+                "route".to_owned(),
+                "del".to_owned(),
+                route.destination.clone(),
+            ];
             if !run_ip(route.is_v6(), &args) {
                 tracing::debug!(
                     destination = %route.destination,
@@ -270,7 +274,10 @@ fn other_vpn_routes(our_interface: &str) -> Vec<Route> {
                 continue;
             }
             // Skip the kernel's own local/broadcast bookkeeping.
-            if matches!(destination, "local" | "broadcast" | "unreachable" | "prohibit") {
+            if matches!(
+                destination,
+                "local" | "broadcast" | "unreachable" | "prohibit"
+            ) {
                 continue;
             }
             if NEVER_MIRROR.iter().any(|p| destination.starts_with(p)) {
@@ -358,7 +365,15 @@ mod tests {
         let route = via_gateway("1.2.3.4", &gateways).expect("should build a route");
         assert_eq!(
             route.add_args(),
-            vec!["route", "add", "1.2.3.4", "via", "192.168.1.1", "dev", "eth0"]
+            vec![
+                "route",
+                "add",
+                "1.2.3.4",
+                "via",
+                "192.168.1.1",
+                "dev",
+                "eth0"
+            ]
         );
     }
 
@@ -437,7 +452,10 @@ mod tests {
         );
         // Either the machine has no default route in a test environment, or the
         // duplicate collapsed; both are acceptable, a duplicate is not.
-        assert!(routes.len() <= 1, "duplicate destinations were not collapsed");
+        assert!(
+            routes.len() <= 1,
+            "duplicate destinations were not collapsed"
+        );
     }
 
     #[test]

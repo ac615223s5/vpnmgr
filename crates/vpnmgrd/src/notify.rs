@@ -48,7 +48,10 @@ pub fn desktop(summary: &str, body: &str, urgency: Urgency) {
             // The child must *be* the user, or their bus will refuse it.
             .uid(uid)
             .gid(gid)
-            .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path=/run/user/{uid}/bus"))
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path=/run/user/{uid}/bus"),
+            )
             .env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"))
             .args([
                 "--app-name=vpnmgr",
@@ -96,10 +99,7 @@ fn sessions() -> Vec<(u32, u32)> {
         if !entry.path().join("bus").exists() {
             continue;
         }
-        let gid = entry
-            .metadata()
-            .map(|m| m.gid())
-            .unwrap_or(uid);
+        let gid = entry.metadata().map(|m| m.gid()).unwrap_or(uid);
         out.push((uid, gid));
     }
     out

@@ -14,9 +14,14 @@ use vpnmgr_probe::Prober;
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let conf = args.next().expect("usage: probe_endpoints <conf> <ip:port>...");
+    let conf = args
+        .next()
+        .expect("usage: probe_endpoints <conf> <ip:port>...");
     let endpoints: Vec<SocketAddr> = args
-        .map(|a| a.parse().unwrap_or_else(|e| panic!("bad endpoint {a:?}: {e}")))
+        .map(|a| {
+            a.parse()
+                .unwrap_or_else(|e| panic!("bad endpoint {a:?}: {e}"))
+        })
         .collect();
     assert!(!endpoints.is_empty(), "give at least one endpoint");
 
@@ -43,7 +48,12 @@ async fn main() {
                 r.outcome,
                 r.samples.len()
             ),
-            None => println!("{:<22} {:>10}  {:?}", r.endpoint.to_string(), "-", r.outcome),
+            None => println!(
+                "{:<22} {:>10}  {:?}",
+                r.endpoint.to_string(),
+                "-",
+                r.outcome
+            ),
         }
     }
 }

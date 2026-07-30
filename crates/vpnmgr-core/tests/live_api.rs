@@ -37,7 +37,11 @@ async fn live_api_still_matches_the_shape_we_parse() {
         assert!(!s.name.is_empty(), "server with no public_name");
         assert!(!s.country_code.is_empty(), "{} has no country_code", s.name);
         assert!(s.bw_max > 0, "{} reports zero capacity", s.name);
-        assert!(!s.wg_ipv4.is_unspecified(), "{} has no WireGuard entry IP", s.name);
+        assert!(
+            !s.wg_ipv4.is_unspecified(),
+            "{} has no WireGuard entry IP",
+            s.name
+        );
     }
 
     let countries: std::collections::BTreeSet<_> =

@@ -576,7 +576,9 @@ impl Config {
             return Err(Error::Config("probe.samples must be at least 1".into()));
         }
         if self.probe.timeout_ms == 0 {
-            return Err(Error::Config("probe.timeout_ms must be greater than 0".into()));
+            return Err(Error::Config(
+                "probe.timeout_ms must be greater than 0".into(),
+            ));
         }
         if self.autotune.interval_minutes == 0 {
             return Err(Error::Config(
@@ -608,7 +610,9 @@ impl Config {
 
         let w = &self.autotune.weights;
         if w.rtt < 0.0 || w.load < 0.0 || w.headroom < 0.0 {
-            return Err(Error::Config("autotune.weights must not be negative".into()));
+            return Err(Error::Config(
+                "autotune.weights must not be negative".into(),
+            ));
         }
         if w.rtt + w.load + w.headroom <= 0.0 {
             return Err(Error::Config(
@@ -652,7 +656,11 @@ impl Config {
     /// Build a config from a freshly imported `.conf`, given where the secrets
     /// will be written. The caller is responsible for writing those files
     /// with `0600` permissions.
-    pub fn from_imported(client: &ClientConfig, private_key_file: PathBuf, preshared_key_file: PathBuf) -> Self {
+    pub fn from_imported(
+        client: &ClientConfig,
+        private_key_file: PathBuf,
+        preshared_key_file: PathBuf,
+    ) -> Self {
         Self {
             provider: Provider {
                 airvpn: AirvpnProvider {
@@ -718,7 +726,13 @@ peer_public_key = "PyLCXAQT8KkM4T+dUsOQfn+Ub3pGxfGlxkIApuig+hk="
         assert_eq!(c.probe.concurrency, 32);
         // Defaults to a full tunnel rather than leaking traffic.
         assert_eq!(c.provider.airvpn.allowed_ips.len(), 2);
-        assert!(c.provider.airvpn.allowed_ips.iter().any(Cidr::is_default_route));
+        assert!(
+            c.provider
+                .airvpn
+                .allowed_ips
+                .iter()
+                .any(Cidr::is_default_route)
+        );
     }
 
     #[test]
@@ -791,9 +805,19 @@ peer_public_key = "PyLCXAQT8KkM4T+dUsOQfn+Ub3pGxfGlxkIApuig+hk="
     #[test]
     fn rejects_a_nonsensical_target() {
         let text = format!("{MINIMAL}\n[autotune]\ntarget_mbps = 0.0\n");
-        assert!(parse(&text).unwrap_err().to_string().contains("greater than 0"));
+        assert!(
+            parse(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("greater than 0")
+        );
         let text = format!("{MINIMAL}\n[autotune]\nheadroom_margin = 0.0\n");
-        assert!(parse(&text).unwrap_err().to_string().contains("greater than 0"));
+        assert!(
+            parse(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("greater than 0")
+        );
     }
 
     #[test]
@@ -830,30 +854,41 @@ peer_public_key = "PyLCXAQT8KkM4T+dUsOQfn+Ub3pGxfGlxkIApuig+hk="
     #[test]
     fn rejects_an_out_of_range_improvement_threshold() {
         let text = format!("{MINIMAL}\n[autotune]\nimprovement_threshold = 1.5\n");
-        assert!(parse(&text).unwrap_err().to_string().contains("between 0.0 and 1.0"));
+        assert!(
+            parse(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("between 0.0 and 1.0")
+        );
     }
 
     #[test]
     fn rejects_all_zero_weights() {
-        let text = format!(
-            "{MINIMAL}\n[autotune.weights]\nrtt = 0.0\nload = 0.0\nheadroom = 0.0\n"
+        let text =
+            format!("{MINIMAL}\n[autotune.weights]\nrtt = 0.0\nload = 0.0\nheadroom = 0.0\n");
+        assert!(
+            parse(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("greater than 0")
         );
-        assert!(parse(&text).unwrap_err().to_string().contains("greater than 0"));
     }
 
     #[test]
     fn rejects_a_malformed_peer_key() {
-        let text = MINIMAL.replace(
-            "PyLCXAQT8KkM4T+dUsOQfn+Ub3pGxfGlxkIApuig+hk=",
-            "not-a-key",
-        );
+        let text = MINIMAL.replace("PyLCXAQT8KkM4T+dUsOQfn+Ub3pGxfGlxkIApuig+hk=", "not-a-key");
         assert!(parse(&text).is_err());
     }
 
     #[test]
     fn rejects_an_empty_address_list() {
         let text = MINIMAL.replace(r#"address = ["10.176.14.22/32"]"#, "address = []");
-        assert!(parse(&text).unwrap_err().to_string().contains("at least one"));
+        assert!(
+            parse(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("at least one")
+        );
     }
 
     #[test]

@@ -149,7 +149,12 @@ impl ClientConfig {
                         peers.push(Section::default());
                         current = peers.last_mut();
                     }
-                    other => return Err(bad(format!("line {}: unknown section [{other}]", lineno + 1))),
+                    other => {
+                        return Err(bad(format!(
+                            "line {}: unknown section [{other}]",
+                            lineno + 1
+                        )));
+                    }
                 }
                 continue;
             }
@@ -473,7 +478,10 @@ AllowedIPs = 10.101.1.0/24,10.100.0.0/16,192.0.2.5/32
 
     #[test]
     fn rejects_multiple_peers_rather_than_silently_picking_one() {
-        let text = format!("{SAMPLE}\n[Peer]\nPublicKey = {}\n", airvpn::WG_PUBLIC_KEY_FALLBACK);
+        let text = format!(
+            "{SAMPLE}\n[Peer]\nPublicKey = {}\n",
+            airvpn::WG_PUBLIC_KEY_FALLBACK
+        );
         let err = parse(&text).unwrap_err().to_string();
         assert!(err.contains("2 [Peer] sections"), "{err}");
     }

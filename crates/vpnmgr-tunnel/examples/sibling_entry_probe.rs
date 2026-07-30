@@ -114,10 +114,7 @@ async fn main() {
         };
         let both = prober.probe_many(&[e1, e3]).await;
         if both.iter().all(|r| r.rtt.is_some()) {
-            println!(
-                "using {} ({}): entry1={e1} entry3={e3}",
-                s.name, s.location
-            );
+            println!("using {} ({}): entry1={e1} entry3={e3}", s.name, s.location);
             chosen = Some((s.clone(), e1, e3));
             break;
         }
@@ -181,7 +178,9 @@ async fn main() {
             let flows = traffic_flows();
             println!(
                 "  round {round}: probe -> {:?}, kernel endpoint {:?}, traffic {}",
-                result.rtt.map(|r| format!("{:.1}ms", r.as_secs_f64() * 1000.0)),
+                result
+                    .rtt
+                    .map(|r| format!("{:.1}ms", r.as_secs_f64() * 1000.0)),
                 status.endpoint,
                 flows.as_deref().unwrap_or("DEAD")
             );

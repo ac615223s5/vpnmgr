@@ -5,7 +5,13 @@ fn main() {
     match vpnmgr_core::ClientConfig::import(&path) {
         Err(e) => println!("PARSE FAILED: {e}"),
         Ok(c) => {
-            println!("addresses      : {:?}", c.addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+            println!(
+                "addresses      : {:?}",
+                c.addresses
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+            );
             println!("dns servers    : {:?}", c.dns);
             println!("search domains : {:?}", c.search_domains);
             println!("mtu            : {:?}", c.mtu);

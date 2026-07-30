@@ -158,7 +158,12 @@ impl Decision {
                 }
             }
             Decision::Switch { to, reason } => {
-                format!("switching to {} ({}): {}", to.name, to.location, reason.describe())
+                format!(
+                    "switching to {} ({}): {}",
+                    to.name,
+                    to.location,
+                    reason.describe()
+                )
             }
             Decision::Propose { to, reason } => format!(
                 "{} ({}) looks better: {}. Run `vpnmgr approve` to move.",
@@ -330,7 +335,10 @@ mod tests {
             probed: 10,
             declined_from: None,
         };
-        assert_eq!(decide(&a, &tune(SwitchPolicy::Auto)), Decision::NotConnected);
+        assert_eq!(
+            decide(&a, &tune(SwitchPolicy::Auto)),
+            Decision::NotConnected
+        );
     }
 
     #[test]

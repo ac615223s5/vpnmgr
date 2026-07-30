@@ -75,7 +75,10 @@ async fn main() {
         "this test expects a full-tunnel config"
     );
 
-    let mut checks = Checks { passed: 0, total: 0 };
+    let mut checks = Checks {
+        passed: 0,
+        total: 0,
+    };
 
     // ---- baseline -------------------------------------------------------
     println!("== baseline ==");
@@ -156,7 +159,10 @@ async fn main() {
     if handshake_ok {
         let ip_after = public_ip();
         println!("  public IP now : {ip_after:?}");
-        checks.check("public IP is reachable through the tunnel", ip_after.is_some());
+        checks.check(
+            "public IP is reachable through the tunnel",
+            ip_after.is_some(),
+        );
         checks.check(
             "public IP changed from the baseline",
             ip_after.is_some() && ip_after != ip_before,
@@ -166,14 +172,14 @@ async fn main() {
         println!("  link DNS      : {link_dns}");
         checks.check(
             "AirVPN resolver is set on the tunnel link",
-            client
-                .dns
-                .iter()
-                .any(|d| link_dns.contains(&d.to_string())),
+            client.dns.iter().any(|d| link_dns.contains(&d.to_string())),
         );
 
         let resolved = sh("resolvectl", &["query", "--legend=no", "example.com"]);
-        println!("  resolve test  : {}", resolved.lines().next().unwrap_or(""));
+        println!(
+            "  resolve test  : {}",
+            resolved.lines().next().unwrap_or("")
+        );
         checks.check("DNS resolves while connected", !resolved.is_empty());
 
         // The leak check that matters: the tunnel's resolver must be the
@@ -185,8 +191,14 @@ async fn main() {
         );
 
         let stats = tunnel.status().expect("status");
-        checks.check("traffic flowed both ways", stats.tx_bytes > 0 && stats.rx_bytes > 0);
-        println!("  tx/rx         : {} / {} bytes", stats.tx_bytes, stats.rx_bytes);
+        checks.check(
+            "traffic flowed both ways",
+            stats.tx_bytes > 0 && stats.rx_bytes > 0,
+        );
+        println!(
+            "  tx/rx         : {} / {} bytes",
+            stats.tx_bytes, stats.rx_bytes
+        );
 
         // ---- live switch ------------------------------------------------
         println!("\n== switching server without teardown ==");
@@ -199,7 +211,8 @@ async fn main() {
             }
             Ok(()) => {
                 println!("  switched {best_name} -> {second_name}");
-                let re_handshook = wait_for_new_handshake(&tunnel, second_endpoint, Duration::from_secs(20));
+                let re_handshook =
+                    wait_for_new_handshake(&tunnel, second_endpoint, Duration::from_secs(20));
                 checks.check("re-handshook with the new server", re_handshook);
                 checks.check(
                     "routes survived the switch",
@@ -251,7 +264,10 @@ async fn main() {
     let dns_after = sh("resolvectl", &["dns"]);
     let ip_restored = public_ip();
 
-    checks.check("interface removed", sh("ip", &["link", "show", IFNAME]).is_empty());
+    checks.check(
+        "interface removed",
+        sh("ip", &["link", "show", IFNAME]).is_empty(),
+    );
     checks.check("default route restored", route_after == route_before);
     checks.check("system DNS restored", dns_after == dns_before);
     checks.check("original public IP restored", ip_restored == ip_before);
@@ -311,7 +327,14 @@ fn wait_for_new_handshake(tunnel: &LinuxTunnel, expected: SocketAddr, timeout: D
         }
         // Nudge traffic so WireGuard is prompted to rekey against the new peer.
         let _ = Command::new("curl")
-            .args(["-s", "--max-time", "3", "-o", "/dev/null", "https://ipinfo.io/ip"])
+            .args([
+                "-s",
+                "--max-time",
+                "3",
+                "-o",
+                "/dev/null",
+                "https://ipinfo.io/ip",
+            ])
             .output();
         std::thread::sleep(Duration::from_millis(500));
     }

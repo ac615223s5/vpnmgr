@@ -38,7 +38,8 @@ fn check(label: &str, ok: bool) -> bool {
 
 fn main() {
     let client = ClientConfig {
-        private_key: SecretKey::from_base64("SPrivateKeyFixturexxxxxxxxxxxxxxxxxxxxxxxxA=").unwrap(),
+        private_key: SecretKey::from_base64("SPrivateKeyFixturexxxxxxxxxxxxxxxxxxxxxxxxA=")
+            .unwrap(),
         addresses: vec!["10.99.99.2/32".parse().unwrap()],
         // No DNS: leaves systemd-resolved alone.
         dns: vec![],
@@ -55,7 +56,10 @@ fn main() {
     let endpoint_a: SocketAddr = ENDPOINT_A.parse().unwrap();
     let endpoint_b: SocketAddr = ENDPOINT_B.parse().unwrap();
 
-    println!("interface {IFNAME} present before: {}", kernel_sees_interface());
+    println!(
+        "interface {IFNAME} present before: {}",
+        kernel_sees_interface()
+    );
 
     let mut tunnel = match LinuxTunnel::new(IFNAME) {
         Ok(t) => t,
@@ -81,7 +85,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    assert_that("kernel reports the interface exists", kernel_sees_interface());
+    assert_that(
+        "kernel reports the interface exists",
+        kernel_sees_interface(),
+    );
 
     match tunnel.status() {
         Err(e) => {
@@ -90,12 +97,18 @@ fn main() {
         }
         Ok(s) => {
             println!("  status: {s:?}");
-            assert_that("endpoint matches what we configured", s.endpoint == Some(endpoint_a));
+            assert_that(
+                "endpoint matches what we configured",
+                s.endpoint == Some(endpoint_a),
+            );
             assert_that("fwmark was applied", s.fwmark == Some(spec.fwmark));
             assert_that("a listen port was allocated", s.listen_port != 0);
             assert_that(
                 "no handshake yet, so the tunnel is not healthy",
-                !s.is_healthy(std::time::SystemTime::now(), std::time::Duration::from_secs(180)),
+                !s.is_healthy(
+                    std::time::SystemTime::now(),
+                    std::time::Duration::from_secs(180),
+                ),
             );
             // PersistentKeepalive makes the kernel attempt a handshake as soon
             // as the peer is configured, so tx is one 148-byte initiation --
@@ -105,7 +118,10 @@ fn main() {
                 "tx is a handshake initiation attempt",
                 s.tx_bytes > 0 && s.tx_bytes % 148 == 0,
             );
-            assert_that("nothing was received from a black-holed endpoint", s.rx_bytes == 0);
+            assert_that(
+                "nothing was received from a black-holed endpoint",
+                s.rx_bytes == 0,
+            );
         }
     }
 
@@ -122,7 +138,10 @@ fn main() {
                 assert_that("status readable after switch", false);
             }
             Ok(s) => {
-                assert_that("endpoint moved to the new server", s.endpoint == Some(endpoint_b));
+                assert_that(
+                    "endpoint moved to the new server",
+                    s.endpoint == Some(endpoint_b),
+                );
                 assert_that("the interface was not recreated", kernel_sees_interface());
                 assert_that(
                     "routes survived the switch",
