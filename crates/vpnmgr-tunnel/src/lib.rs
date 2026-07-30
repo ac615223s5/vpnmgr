@@ -28,8 +28,12 @@ use std::time::SystemTime;
 use vpnmgr_core::ClientConfig;
 
 #[cfg(target_os = "linux")]
+pub mod killswitch;
+#[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(target_os = "linux")]
+pub use killswitch::Killswitch;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxTunnel;
 
@@ -67,6 +71,13 @@ pub enum Error {
 
     #[error("interface name {0:?} is not usable: {1}")]
     BadInterfaceName(String, &'static str),
+
+    #[error("{operation} the kill switch failed: {source}")]
+    Killswitch {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

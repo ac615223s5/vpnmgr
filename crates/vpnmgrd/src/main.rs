@@ -230,6 +230,27 @@ async fn handle(request: Request, state: &Arc<Mutex<State>>) -> Response {
             Err(e) => Response::error(e),
         },
 
+        Request::Speedtest => match state.speedtest().await {
+            Ok(report) => Response::Speed(Box::new(report)),
+            Err(e) => Response::error(e),
+        },
+
+        Request::Baseline { confirm } => {
+            if confirm {
+                match state.baseline().await {
+                    Ok(report) => Response::Speed(Box::new(report)),
+                    Err(e) => Response::error(e),
+                }
+            } else {
+                Response::error(crate::state::Error::ConsentRequired)
+            }
+        }
+
+        Request::Killswitch { enable } => match state.killswitch(enable) {
+            Ok(report) => Response::Killswitch(report),
+            Err(e) => Response::error(e),
+        },
+
         Request::Dismiss => match state.dismiss() {
             Ok(name) => Response::ok(format!("dismissed the proposal to move to {name}")),
             Err(e) => Response::error(e),

@@ -8,9 +8,12 @@ use std::time::{Duration, Instant, SystemTime};
 use vpnmgr_core::airvpn::{self, Server, ServerList};
 use vpnmgr_core::config::Config;
 use vpnmgr_core::{ClientConfig, filter, score};
-use vpnmgr_ipc::{PendingSwitch, RankedServer, ServerSummary, StatusReport, SweepSummary, TuneReport};
+use vpnmgr_ipc::{
+    KillswitchReport, PendingSwitch, RankedServer, ServerSummary, SpeedReport, SpeedSample,
+    StatusReport, SweepSummary, TuneReport,
+};
 use vpnmgr_probe::{Prober, sweep};
-use vpnmgr_tunnel::{DEFAULT_FWMARK, LinuxTunnel, TunnelBackend, TunnelSpec};
+use vpnmgr_tunnel::{DEFAULT_FWMARK, Killswitch, LinuxTunnel, TunnelBackend, TunnelSpec};
 
 use crate::tuner::{self, Assessment, Decision};
 
@@ -94,6 +97,13 @@ pub enum Error {
     NoCandidates(String),
     #[error("nothing is waiting for approval")]
     NoPendingSwitch,
+    #[error("measuring throughput: {0}")]
+    Throughput(#[from] vpnmgr_probe::throughput::Error),
+    #[error(
+        "this drops the tunnel, exposing your real IP address and releasing the \
+         kill switch, so it needs explicit confirmation: pass --yes"
+    )]
+    ConsentRequired,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -257,7 +267,7 @@ impl State {
             .with_interface(vpnmgr_tunnel::DEFAULT_INTERFACE)
             .with_fwmark(DEFAULT_FWMARK);
 
-        let mut tunnel = LinuxTunnel::new(vpnmgr_tunnel::DEFAULT_INTERFACE)?;
+        let mut tunnel = self.new_tunnel()?;
         tunnel.up(&spec)?;
 
         self.tunnel = Some(tunnel);
@@ -425,6 +435,154 @@ impl State {
             out.truncate(limit);
         }
         Ok(out)
+    }
+
+    /// A tunnel handle carrying the configured kill switch, if any.
+    fn new_tunnel(&self) -> Result<LinuxTunnel> {
+        let tunnel = LinuxTunnel::new(vpnmgr_tunnel::DEFAULT_INTERFACE)?;
+        if self.config.killswitch.enabled {
+            Ok(tunnel.with_killswitch(Killswitch::new(
+                vpnmgr_tunnel::DEFAULT_INTERFACE,
+                DEFAULT_FWMARK,
+                self.config.killswitch.allow_lan,
+            )))
+        } else {
+            Ok(tunnel)
+        }
+    }
+
+    fn throughput_settings(&self) -> vpnmgr_probe::throughput::Settings {
+        vpnmgr_probe::throughput::Settings {
+            url: self.config.throughput.request_url(),
+            bytes: self.config.throughput.bytes,
+            timeout: Duration::from_secs(self.config.throughput.timeout_secs),
+        }
+    }
+
+    /// Measure throughput on whatever path is currently in use.
+    pub async fn speedtest(&mut self) -> Result<SpeedReport> {
+        let settings = self.throughput_settings();
+        let min_mbps = self.config.autotune.min_mbps;
+        let connected = self.current.as_ref().map(|c| c.server.clone());
+
+        let sample = measure(&settings).await?;
+        let meets_target = sample.mbps >= min_mbps;
+
+        let verdict = match &connected {
+            Some(server) => format!(
+                "{:.1} Mbps through {server} ({} the {:.0} Mbps target)",
+                sample.mbps,
+                if meets_target { "meets" } else { "below" },
+                min_mbps
+            ),
+            None => format!(
+                "{:.1} Mbps with no tunnel up; this is your direct connection",
+                sample.mbps
+            ),
+        };
+
+        Ok(SpeedReport {
+            tunnelled: connected.is_some().then(|| sample.clone()),
+            direct: connected.is_none().then_some(sample),
+            server: connected,
+            min_mbps,
+            meets_target,
+            verdict,
+        })
+    }
+
+    /// Measure through the tunnel, then without it, then restore the tunnel.
+    ///
+    /// This is the "is it the VPN or my connection?" question answered
+    /// directly. It is disruptive on purpose: the tunnel comes down, which
+    /// exposes the real IP and releases the kill switch, so the caller has to
+    /// have said yes explicitly.
+    pub async fn baseline(&mut self) -> Result<SpeedReport> {
+        let settings = self.throughput_settings();
+        let min_mbps = self.config.autotune.min_mbps;
+
+        let Some(current) = self.current.clone() else {
+            // Nothing to compare against; this is just a direct measurement.
+            return self.speedtest().await;
+        };
+
+        let tunnelled = measure(&settings).await?;
+
+        tracing::info!("dropping the tunnel for a direct measurement");
+        self.disconnect()?;
+
+        // Whatever happens to the direct measurement, the tunnel goes back up.
+        let direct = measure(&settings).await;
+
+        tracing::info!(server = %current.server, "restoring the tunnel");
+        let restored = self.connect(Some(current.server.clone())).await;
+        if let Err(e) = &restored {
+            tracing::error!(
+                server = %current.server,
+                "could not restore the tunnel after the baseline: {e}"
+            );
+        }
+
+        let direct = direct?;
+        restored?;
+
+        let meets_target = tunnelled.mbps >= min_mbps;
+        // A ratio is what answers the question; absolute numbers on their own
+        // do not say whether the VPN is the bottleneck.
+        let retained = if direct.mbps > 0.0 {
+            tunnelled.mbps / direct.mbps
+        } else {
+            0.0
+        };
+        let verdict = format!(
+            "{:.1} Mbps through {} vs {:.1} Mbps direct — the tunnel keeps {:.0}% of \
+             your connection. {}",
+            tunnelled.mbps,
+            current.server,
+            direct.mbps,
+            retained * 100.0,
+            if retained >= 0.7 {
+                "That is normal overhead; a slow link here is your connection, not the VPN."
+            } else if direct.mbps < min_mbps {
+                "Your connection itself is below the target, so no server can fix it."
+            } else {
+                "The VPN is costing you a lot; a different server may do better."
+            }
+        );
+
+        Ok(SpeedReport {
+            tunnelled: Some(tunnelled),
+            direct: Some(direct),
+            server: Some(current.server),
+            min_mbps,
+            meets_target,
+            verdict,
+        })
+    }
+
+    /// Turn the kill switch on or off at runtime, or just report on it.
+    pub fn killswitch(&mut self, enable: Option<bool>) -> Result<KillswitchReport> {
+        match enable {
+            Some(true) => {
+                Killswitch::new(
+                    vpnmgr_tunnel::DEFAULT_INTERFACE,
+                    DEFAULT_FWMARK,
+                    self.config.killswitch.allow_lan,
+                )
+                .engage()?;
+                self.config.killswitch.enabled = true;
+            }
+            Some(false) => {
+                Killswitch::release()?;
+                self.config.killswitch.enabled = false;
+            }
+            None => {}
+        }
+        Ok(KillswitchReport {
+            engaged: Killswitch::is_engaged(),
+            configured: self.config.killswitch.enabled,
+            dropped: Killswitch::dropped(),
+        })
     }
 
     /// The cached ranking from the last sweep, best first.
@@ -627,4 +785,17 @@ fn to_ranked(s: &score::Scored<'_>) -> RankedServer {
         entry: s.entry,
         endpoint: s.endpoint,
     }
+}
+
+/// Run one throughput measurement, converting it for the wire.
+async fn measure(
+    settings: &vpnmgr_probe::throughput::Settings,
+) -> Result<SpeedSample> {
+    let t = vpnmgr_probe::throughput::measure(settings).await?;
+    Ok(SpeedSample {
+        mbps: t.mbps,
+        bytes: t.bytes,
+        elapsed_ms: t.elapsed.as_millis() as u64,
+        truncated: t.truncated,
+    })
 }

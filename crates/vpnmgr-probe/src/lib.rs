@@ -35,6 +35,7 @@
 //! [`Prober::probe_many`] refuses to touch the excluded endpoint.
 
 pub mod socket;
+pub mod throughput;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -27,6 +27,46 @@ pub struct Config {
     pub autotune: Autotune,
     #[serde(default)]
     pub probe: Probe,
+    #[serde(default)]
+    pub killswitch: Killswitch,
+    #[serde(default)]
+    pub throughput: Throughput,
+}
+
+/// Settings for the Tier-2 throughput test.
+///
+/// Never runs as part of a sweep or the scheduled tuning pass: it moves tens of
+/// megabytes, and doing that every 30 minutes would cost more than it is worth.
+/// It runs when explicitly asked for, via `vpnmgr speedtest` or `vpnmgr
+/// baseline`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Throughput {
+    /// Where to pull the payload from. Must accept a byte count and return
+    /// incompressible data.
+    #[serde(default = "default_throughput_url")]
+    pub url: String,
+    #[serde(default = "default_throughput_bytes")]
+    pub bytes: u64,
+    #[serde(default = "default_throughput_timeout")]
+    pub timeout_secs: u64,
+}
+
+/// Refuse to let traffic leave outside the tunnel.
+///
+/// Off by default, and deliberately so: it is enforced with firewall rules that
+/// outlive the daemon, so a crash leaves the machine with no direct internet
+/// access until they are cleared. That is the correct behaviour for a kill
+/// switch and the wrong surprise to hand someone who did not ask for it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Killswitch {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Keep the local network reachable. Without this, enabling the kill switch
+    /// also cuts off printers, NAS boxes and inbound SSH.
+    #[serde(default = "default_allow_lan")]
+    pub allow_lan: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -196,6 +236,18 @@ fn default_w_load() -> f64 {
 fn default_w_bandwidth() -> f64 {
     0.1
 }
+fn default_allow_lan() -> bool {
+    true
+}
+fn default_throughput_url() -> String {
+    "https://speed.cloudflare.com/__down?bytes=".into()
+}
+fn default_throughput_bytes() -> u64 {
+    25_000_000
+}
+fn default_throughput_timeout() -> u64 {
+    30
+}
 
 impl Default for Filters {
     fn default() -> Self {
@@ -228,6 +280,37 @@ impl Default for Weights {
             rtt: default_w_rtt(),
             load: default_w_load(),
             bandwidth: default_w_bandwidth(),
+        }
+    }
+}
+
+impl Default for Killswitch {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_lan: default_allow_lan(),
+        }
+    }
+}
+
+impl Default for Throughput {
+    fn default() -> Self {
+        Self {
+            url: default_throughput_url(),
+            bytes: default_throughput_bytes(),
+            timeout_secs: default_throughput_timeout(),
+        }
+    }
+}
+
+impl Throughput {
+    /// The full request URL. The byte count is appended when the configured
+    /// URL ends in `=`, which is the shape the default endpoint takes.
+    pub fn request_url(&self) -> String {
+        if self.url.ends_with('=') {
+            format!("{}{}", self.url, self.bytes)
+        } else {
+            self.url.clone()
         }
     }
 }
@@ -400,6 +483,8 @@ impl Config {
             filters: Filters::default(),
             autotune: Autotune::default(),
             probe: Probe::default(),
+            killswitch: Killswitch::default(),
+            throughput: Throughput::default(),
         }
     }
 }

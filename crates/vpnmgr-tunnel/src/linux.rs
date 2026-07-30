@@ -19,6 +19,10 @@ pub struct LinuxTunnel {
     /// Tracks whether *we* created the interface, so `down` does not remove
     /// something another tool owns.
     created: bool,
+    /// Firewall enforcement, when the user asked for it. Engaged as part of
+    /// `up` and released by `down`, so the protected window is exactly the
+    /// window in which traffic is supposed to be tunnelled.
+    killswitch: Option<crate::Killswitch>,
 }
 
 impl LinuxTunnel {
@@ -29,7 +33,14 @@ impl LinuxTunnel {
             api,
             interface,
             created: false,
+            killswitch: None,
         })
+    }
+
+    /// Enforce the kill switch for the lifetime of this tunnel.
+    pub fn with_killswitch(mut self, killswitch: crate::Killswitch) -> Self {
+        self.killswitch = Some(killswitch);
+        self
     }
 
     /// Build the peer for `spec`. Identical for every server except the
@@ -49,13 +60,6 @@ impl LinuxTunnel {
 }
 
 impl LinuxTunnel {
-    /// Rebind the interface to a different UDP source port.
-    ///
-    /// Deliberately re-applies the whole interface configuration minus the
-    /// peers: `configure_interface` is the only way to set the listen port, and
-    /// passing an empty peer list keeps it from re-adding the peer we are in
-    /// the middle of replacing. Routes are not touched, because
-    /// `configure_peer_routing` is a separate call.
     /// Collapse duplicated policy routing rules back down to one of each.
     ///
     /// `configure_peer_routing` unconditionally *adds* its two rules — the
@@ -110,6 +114,13 @@ impl LinuxTunnel {
         }
     }
 
+    /// Rebind the interface to a different UDP source port.
+    ///
+    /// Deliberately re-applies the whole interface configuration minus the
+    /// peers: `configure_interface` is the only way to set the listen port, and
+    /// passing an empty peer list keeps it from re-adding the peer we are in
+    /// the middle of replacing. Routes are not touched here, because
+    /// `configure_peer_routing` is a separate call.
     fn rotate_listen_port(&mut self, spec: &TunnelSpec<'_>) -> Result<()> {
         let config = InterfaceConfiguration {
             name: self.interface.clone(),
@@ -175,6 +186,68 @@ impl TunnelBackend for LinuxTunnel {
     fn up(&mut self, spec: &TunnelSpec<'_>) -> Result<()> {
         spec.validate()?;
 
+        // Engaged before anything else, so there is no instant between "we
+        // decided to tunnel" and "traffic is confined". `oifname` is matched by
+        // name at runtime, so naming an interface that does not exist yet is
+        // fine.
+        if let Some(killswitch) = &self.killswitch {
+            killswitch.engage()?;
+            tracing::info!(interface = %self.interface, "kill switch engaged");
+        }
+
+        // From here on a failure must not strand the machine behind rules for a
+        // tunnel that never came up.
+        let result = self.bring_up(spec);
+        if result.is_err()
+            && let Some(_killswitch) = &self.killswitch
+        {
+            if let Err(e) = crate::Killswitch::release() {
+                tracing::error!(
+                    "could not release the kill switch after a failed connect: {e}. {}",
+                    crate::Killswitch::recovery_hint()
+                );
+            } else {
+                tracing::info!("kill switch released after a failed connect");
+            }
+        }
+        result
+    }
+
+    fn switch_endpoint(&mut self, spec: &TunnelSpec<'_>) -> Result<()> {
+        self.retarget(spec)
+    }
+
+    fn down(&mut self) -> Result<()> {
+        let result = self
+            .api
+            .remove_interface()
+            .map_err(|e| wg_err("removing the interface", &self.interface, e));
+        self.created = false;
+
+        // Released even if teardown failed: the interface state is unknown, and
+        // leaving the machine with no route out is worse than a brief exposure
+        // the user explicitly asked for by disconnecting.
+        if self.killswitch.is_some() {
+            crate::Killswitch::release()?;
+            tracing::info!("kill switch released");
+        }
+
+        result?;
+        tracing::info!(interface = %self.interface, "tunnel down");
+        Ok(())
+    }
+
+    fn status(&self) -> Result<TunnelStatus> {
+        self.read_status()
+    }
+
+    fn interface(&self) -> &str {
+        &self.interface
+    }
+}
+
+impl LinuxTunnel {
+    fn bring_up(&mut self, spec: &TunnelSpec<'_>) -> Result<()> {
         self.api
             .create_interface()
             .map_err(|e| wg_err("creating the interface", &self.interface, e))?;
@@ -227,7 +300,7 @@ impl TunnelBackend for LinuxTunnel {
         Ok(())
     }
 
-    fn switch_endpoint(&mut self, spec: &TunnelSpec<'_>) -> Result<()> {
+    fn retarget(&mut self, spec: &TunnelSpec<'_>) -> Result<()> {
         // Switching servers on a shared-key fleet takes three steps, and all
         // three are load-bearing.
         //
@@ -297,16 +370,7 @@ impl TunnelBackend for LinuxTunnel {
         Ok(())
     }
 
-    fn down(&mut self) -> Result<()> {
-        self.api
-            .remove_interface()
-            .map_err(|e| wg_err("removing the interface", &self.interface, e))?;
-        self.created = false;
-        tracing::info!(interface = %self.interface, "tunnel down");
-        Ok(())
-    }
-
-    fn status(&self) -> Result<TunnelStatus> {
+    fn read_status(&self) -> Result<TunnelStatus> {
         let host = self
             .api
             .read_interface_data()
@@ -331,10 +395,6 @@ impl TunnelBackend for LinuxTunnel {
             fwmark: host.fwmark,
         })
     }
-
-    fn interface(&self) -> &str {
-        &self.interface
-    }
 }
 
 impl Drop for LinuxTunnel {
@@ -348,6 +408,20 @@ impl Drop for LinuxTunnel {
                 interface = %self.interface,
                 error = %e,
                 "failed to remove the interface while dropping the tunnel"
+            );
+        }
+
+        // The interface is going away, so the rules can only block traffic that
+        // now has nowhere to be tunnelled. Releasing here covers an orderly
+        // shutdown; a hard kill still leaves them in place, which is the
+        // intended fail-closed behaviour rather than an oversight.
+        if self.killswitch.is_some()
+            && let Err(e) = crate::Killswitch::release()
+        {
+            tracing::error!(
+                error = %e,
+                "failed to release the kill switch while dropping the tunnel. {}",
+                crate::Killswitch::recovery_hint()
             );
         }
     }

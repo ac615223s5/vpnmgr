@@ -59,6 +59,17 @@ pub enum Request {
     Approve,
     /// Discard the pending switch proposal without moving.
     Dismiss,
+    /// Measure throughput on the current path.
+    Speedtest,
+    /// Compare throughput through the tunnel against throughput without it.
+    ///
+    /// `confirm` must be set: this briefly drops the tunnel, which exposes the
+    /// real IP address and releases the kill switch. The daemon refuses
+    /// otherwise rather than assuming consent.
+    Baseline { confirm: bool },
+    /// Turn the kill switch on or off, or report its state when `enable` is
+    /// `None`.
+    Killswitch { enable: Option<bool> },
 }
 
 /// Adjacently tagged rather than internally tagged: serde cannot serialise a
@@ -75,6 +86,10 @@ pub enum Response {
     Version { version: String },
     /// Outcome of a tuning pass.
     Tuned(Box<TuneReport>),
+    /// Outcome of a throughput measurement.
+    Speed(Box<SpeedReport>),
+    /// State of the kill switch.
+    Killswitch(KillswitchReport),
 }
 
 impl Response {
@@ -140,6 +155,46 @@ pub struct TuneReport {
     /// The tunnel is up but no server answered. Deliberately not acted on —
     /// it implicates the local link — but the user should know.
     pub nothing_reachable: bool,
+}
+
+/// One throughput measurement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeedSample {
+    pub mbps: f64,
+    pub bytes: u64,
+    pub elapsed_ms: u64,
+    /// The transfer hit its timeout before the full payload arrived. Still a
+    /// real rate over a real interval, but not the whole payload.
+    pub truncated: bool,
+}
+
+/// Result of `speedtest` or `baseline`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeedReport {
+    /// Measured through the tunnel, when one was up.
+    pub tunnelled: Option<SpeedSample>,
+    /// Measured with the tunnel down. Only ever set by `baseline`.
+    pub direct: Option<SpeedSample>,
+    /// Server the tunnelled sample went through.
+    pub server: Option<String>,
+    /// The `autotune.min_mbps` floor this was judged against.
+    pub min_mbps: f64,
+    /// Whether the tunnelled rate cleared that floor.
+    pub meets_target: bool,
+    /// Plain-language conclusion, including the VPN-versus-direct comparison
+    /// when both samples exist.
+    pub verdict: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KillswitchReport {
+    /// Whether the firewall rules are currently installed.
+    pub engaged: bool,
+    /// Whether the config asks for it on every connect.
+    pub configured: bool,
+    /// Packets it has dropped, when the counter could be read. Non-zero means
+    /// something genuinely tried to leave outside the tunnel.
+    pub dropped: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -288,6 +343,11 @@ mod tests {
         roundtrip(Request::Autotune);
         roundtrip(Request::Approve);
         roundtrip(Request::Dismiss);
+        roundtrip(Request::Speedtest);
+        roundtrip(Request::Baseline { confirm: true });
+        roundtrip(Request::Baseline { confirm: false });
+        roundtrip(Request::Killswitch { enable: None });
+        roundtrip(Request::Killswitch { enable: Some(true) });
     }
 
     fn sample_ranked() -> RankedServer {
@@ -369,6 +429,24 @@ mod tests {
         response_roundtrip(Response::Version {
             version: "0.1.0".into(),
         });
+        response_roundtrip(Response::Killswitch(KillswitchReport {
+            engaged: true,
+            configured: true,
+            dropped: Some(0),
+        }));
+        response_roundtrip(Response::Speed(Box::new(SpeedReport {
+            tunnelled: Some(SpeedSample {
+                mbps: 187.4,
+                bytes: 25_000_000,
+                elapsed_ms: 1067,
+                truncated: false,
+            }),
+            direct: None,
+            server: Some("Kornephoros".into()),
+            min_mbps: 50.0,
+            meets_target: true,
+            verdict: "187.4 Mbps through Kornephoros".into(),
+        })));
         response_roundtrip(Response::Tuned(Box::new(TuneReport {
             summary: "switching to Chamukuy".into(),
             switched: true,

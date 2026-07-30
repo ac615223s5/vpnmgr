@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use vpnmgr_ipc::{DEFAULT_SOCKET, RankedServer, Request, Response, StatusReport};
+use vpnmgr_ipc::{DEFAULT_SOCKET, RankedServer, Request, Response, SpeedReport, StatusReport};
 
 #[derive(Parser)]
 #[command(name = "vpnmgr", about = "Control the WireGuard VPN manager", version)]
@@ -65,6 +65,21 @@ enum Command {
     Approve,
     /// Discard the tuner's pending proposal.
     Dismiss,
+    /// Measure throughput on the current connection.
+    Speedtest,
+    /// Compare throughput through the VPN against your connection without it.
+    ///
+    /// Briefly drops the tunnel, which exposes your real IP address.
+    Baseline {
+        /// Required, because this exposes your real IP address.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Turn the kill switch on or off, or show its state.
+    Killswitch {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
     /// Import an AirVPN .conf and print the config file to install.
     Import {
         /// Path to the .conf from AirVPN's Config Generator.
@@ -107,6 +122,11 @@ async fn main() -> ExitCode {
         Command::Autotune => Request::Autotune,
         Command::Approve => Request::Approve,
         Command::Dismiss => Request::Dismiss,
+        Command::Speedtest => Request::Speedtest,
+        Command::Baseline { yes } => Request::Baseline { confirm: *yes },
+        Command::Killswitch { state } => Request::Killswitch {
+            enable: state.as_deref().map(|s| s == "on"),
+        },
         Command::Import { .. } => unreachable!("handled above"),
     };
 
@@ -166,6 +186,27 @@ async fn main() -> ExitCode {
             println!("\n{} servers", servers.len());
             ExitCode::SUCCESS
         }
+        Response::Speed(report) => {
+            print_speed(&report);
+            ExitCode::SUCCESS
+        }
+        Response::Killswitch(report) => {
+            println!(
+                "kill switch: {}",
+                if report.engaged { "ENGAGED" } else { "off" }
+            );
+            println!(
+                "  applied on connect: {}",
+                if report.configured { "yes" } else { "no" }
+            );
+            if let Some(dropped) = report.dropped {
+                println!("  packets blocked   : {dropped}");
+            }
+            if report.engaged && !report.configured {
+                println!("\n  engaged manually; `vpnmgr killswitch off` to clear it");
+            }
+            ExitCode::SUCCESS
+        }
         Response::Tuned(report) => {
             println!("{}", report.summary);
             if let Some(pending) = &report.pending {
@@ -178,6 +219,29 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+fn print_speed(report: &SpeedReport) {
+    let line = |label: &str, s: &vpnmgr_ipc::SpeedSample| {
+        println!(
+            "  {label:<10}: {:>7.1} Mbps  ({:.1} MB in {:.2}s{})",
+            s.mbps,
+            s.bytes as f64 / 1_000_000.0,
+            s.elapsed_ms as f64 / 1000.0,
+            if s.truncated { ", timed out" } else { "" }
+        );
+    };
+
+    if let Some(s) = &report.tunnelled {
+        line(
+            report.server.as_deref().unwrap_or("via VPN"),
+            s,
+        );
+    }
+    if let Some(s) = &report.direct {
+        line("direct", s);
+    }
+    println!("\n{}", report.verdict);
 }
 
 fn print_status(report: &StatusReport) {
