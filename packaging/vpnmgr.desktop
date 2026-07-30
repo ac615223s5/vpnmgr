@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=VPN Manager
+GenericName=VPN
+Comment=Connect over WireGuard and stay on the fastest server
+Exec=/usr/local/bin/vpnmgr-tray
+Icon=network-vpn
+Terminal=false
+# Exactly one main category. Listing several (Network, System, Security) makes
+# the entry appear once per category in the menu, and "Security" is an
+# additional category whose related mains are Settings/System, not Network.
+Categories=Network;
+Keywords=VPN;WireGuard;AirVPN;privacy;tunnel;
+# There is no window to wait for — this puts an icon in the system tray. With
+# startup notification on, the desktop would show a busy cursor until it gave
+# up waiting for a window that never appears.
+StartupNotify=false
+# Deliberately not restricted with OnlyShowIn. Hiding the entry on desktops
+# without a StatusNotifierItem host would make it silently absent; the tray
+# instead reports why it cannot start, as a desktop notification, because a
+# menu launch has no terminal to print to.

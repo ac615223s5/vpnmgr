@@ -29,6 +29,12 @@ install -m 0755 target/release/vpnmgrd "$PREFIX/bin/vpnmgrd"
 install -m 0755 target/release/vpnmgr "$PREFIX/bin/vpnmgr"
 install -m 0755 target/release/vpnmgr-tray "$PREFIX/bin/vpnmgr-tray"
 
+echo "==> installing the applications-menu entry"
+install -d -m 0755 /usr/share/applications
+install -m 0644 packaging/vpnmgr.desktop /usr/share/applications/vpnmgr.desktop
+# Refresh the menu cache so the entry shows up without a re-login.
+update-desktop-database /usr/share/applications 2>/dev/null || true
+
 echo "==> installing the tray autostart entry"
 install -d -m 0755 /etc/xdg/autostart
 install -m 0644 packaging/vpnmgr-tray.desktop /etc/xdg/autostart/vpnmgr-tray.desktop
@@ -87,4 +93,6 @@ echo "    vpnmgr status"
 echo "    vpnmgr test --country ca"
 echo "    vpnmgr connect"
 echo
-echo "The tray starts automatically at next login, or run vpnmgr-tray now."
+echo "The tray starts automatically at next login, and is in your applications"
+echo "menu as \"VPN Manager\". Launching it while it is already running just"
+echo "points you back at the existing tray icon rather than adding a second."

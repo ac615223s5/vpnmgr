@@ -372,6 +372,74 @@ impl Tray for VpnTray {
     }
 }
 
+/// Holds the single-instance lock for as long as the process lives.
+///
+/// The tray is reachable two ways — autostart at login and the applications
+/// menu — so without this, launching it from the menu while it is already
+/// running would put a second identical icon in the tray. The lock is an
+/// advisory `flock` released by the kernel when the process exits, so it
+/// cannot be left stale by a crash the way a pidfile can.
+struct InstanceLock(#[allow(dead_code)] std::fs::File);
+
+/// Why we did or did not get the lock.
+///
+/// "Another instance holds it" and "the lock file could not be created" have to
+/// be told apart. Treating them the same would mean an unwritable runtime
+/// directory stopped the tray from ever starting, while telling the user it was
+/// already running.
+enum Instance {
+    /// We are the only instance.
+    Only(InstanceLock),
+    /// Another tray already has it.
+    AlreadyRunning,
+    /// The lock could not be taken at all. Not a reason to refuse to start.
+    Unavailable(std::io::Error),
+}
+
+fn acquire_instance_lock() -> Instance {
+    // Per-user, and cleared on reboot.
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    lock_at(std::path::Path::new(&dir).join("vpnmgr-tray.lock"))
+}
+
+/// The lock itself, against an explicit path so it is testable without
+/// disturbing a tray the user actually has running.
+fn lock_at(path: impl AsRef<std::path::Path>) -> Instance {
+    use std::os::unix::io::AsRawFd;
+
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path.as_ref())
+    {
+        Ok(file) => file,
+        Err(e) => return Instance::Unavailable(e),
+    };
+
+    // SAFETY: the fd is valid for the duration of the call, and LOCK_NB means
+    // this never blocks.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Instance::Only(InstanceLock(file))
+    } else {
+        Instance::AlreadyRunning
+    }
+}
+
+/// Tell the user something when there is no terminal to print to.
+///
+/// Launching from the applications menu discards stdout and stderr, so a bare
+/// `eprintln!` would look like the menu entry simply did nothing.
+fn notify_user(summary: &str, body: &str) {
+    eprintln!("{summary}: {body}");
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=vpnmgr", "--icon=network-vpn", summary, body])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 /// A non-interactive line of text in the menu.
 fn disabled(label: String) -> MenuItem<VpnTray> {
     StandardItem {
@@ -392,16 +460,37 @@ async fn main() {
         .init();
 
     let args = Args::parse();
+
+    // Held for the whole run; dropping it would let a second icon appear.
+    let _lock = match acquire_instance_lock() {
+        Instance::Only(lock) => Some(lock),
+        Instance::AlreadyRunning => {
+            notify_user(
+                "vpnmgr is already running",
+                "Look for the VPN icon in your system tray.",
+            );
+            return;
+        }
+        // Starting without the guard is better than not starting at all; the
+        // worst case is a duplicate icon, which the user can close.
+        Instance::Unavailable(e) => {
+            tracing::warn!("could not take the single-instance lock ({e}); starting anyway");
+            None
+        }
+    };
+
     let (tx, rx) = mpsc::unbounded_channel();
 
     let handle = match VpnTray::new(tx).spawn().await {
         Ok(handle) => handle,
         Err(e) => {
-            eprintln!(
-                "could not register a tray icon: {e}\n\
-                 this needs a StatusNotifierItem host on the session bus \
-                 (KDE, or xapp-sn-watcher under Cinnamon, or the AppIndicator \
-                 extension under GNOME)"
+            notify_user(
+                "vpnmgr tray could not start",
+                &format!(
+                    "No system tray was found on the session bus ({e}). \
+                     Cinnamon needs xapp-sn-watcher; GNOME needs the AppIndicator \
+                     extension. The `vpnmgr` command still works."
+                ),
             );
             std::process::exit(1);
         }
@@ -590,5 +679,58 @@ fn human_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("vpnmgr-tray-test-{name}-{}.lock", std::process::id()));
+        p
+    }
+
+    /// The whole point: launching from the applications menu while the tray is
+    /// already running must not produce a second icon.
+    #[test]
+    fn a_second_instance_cannot_take_the_lock() {
+        let path = temp_path("second");
+        let first = match lock_at(&path) {
+            Instance::Only(lock) => lock,
+            _ => panic!("first instance should acquire the lock"),
+        };
+        assert!(
+            matches!(lock_at(&path), Instance::AlreadyRunning),
+            "a second instance acquired the lock and would have added a duplicate tray icon"
+        );
+        drop(first);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// flock is released by the kernel on close, so an exited instance never
+    /// leaves the lock stale the way a pidfile would.
+    #[test]
+    fn the_lock_is_released_when_the_holder_exits() {
+        let path = temp_path("released");
+        let first = lock_at(&path);
+        assert!(matches!(first, Instance::Only(_)));
+        drop(first);
+        assert!(
+            matches!(lock_at(&path), Instance::Only(_)),
+            "the lock outlived its holder, so the tray could never be restarted"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An unwritable lock location must not masquerade as "already running",
+    /// which would stop the tray from ever starting and say the wrong reason.
+    #[test]
+    fn an_unusable_lock_path_is_not_mistaken_for_a_running_instance() {
+        assert!(matches!(
+            lock_at("/proc/definitely/not/writable.lock"),
+            Instance::Unavailable(_)
+        ));
     }
 }
