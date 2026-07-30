@@ -22,7 +22,22 @@ if [[ -z "$CONF" || ! -f "$CONF" ]]; then
 fi
 
 echo "==> building"
-cargo build --release
+# rustup installs cargo into the *user's* ~/.cargo/bin, which is not on root's
+# PATH, so a plain `cargo build` here fails under sudo. Build as the invoking
+# user when we can, and otherwise accept binaries they already built.
+if command -v cargo >/dev/null 2>&1; then
+    cargo build --release
+elif [[ -n "${SUDO_USER:-}" ]] && sudo -u "$SUDO_USER" bash -lc 'command -v cargo' >/dev/null 2>&1; then
+    echo "    cargo is not on root's PATH; building as $SUDO_USER"
+    sudo -u "$SUDO_USER" bash -lc 'cargo build --release'
+elif [[ -x target/release/vpnmgrd && -x target/release/vpnmgr && -x target/release/vpnmgr-tray ]]; then
+    echo "    cargo not found; using the binaries already in target/release"
+else
+    echo "cargo not found, and target/release has no prebuilt binaries." >&2
+    echo "Build them first, as your normal user:" >&2
+    echo "    cargo build --release" >&2
+    exit 1
+fi
 
 echo "==> installing binaries into $PREFIX/bin"
 install -m 0755 target/release/vpnmgrd "$PREFIX/bin/vpnmgrd"

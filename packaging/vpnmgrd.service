@@ -10,10 +10,16 @@ ExecStart=/usr/local/bin/vpnmgrd --config /etc/vpnmgr/config.toml
 Restart=on-failure
 RestartSec=5
 
-# Creates /run/vpnmgr with the right mode; the daemon then chowns the socket
-# itself to root:vpnmgr 0660 so members of that group can drive it.
+# Creates /run/vpnmgr; the daemon then chowns the socket itself to
+# root:vpnmgr 0660 so members of that group can drive it.
+#
+# 0755 and not 0750: systemd owns this directory as the service's user, which
+# is root, so a stricter mode leaves it root:root and members of the vpnmgr
+# group cannot traverse into it -- the socket's own permissions never get a
+# chance to apply, and every client sees "permission denied". Traversal on its
+# own grants nothing; access is still gated by the 0660 socket inside.
 RuntimeDirectory=vpnmgr
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0755
 
 # The daemon manages network interfaces, routes and DNS, so it needs
 # CAP_NET_ADMIN. SETUID/SETGID are for dropping privileges when running
