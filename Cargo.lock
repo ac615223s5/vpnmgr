@@ -2210,7 +2210,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vpnmgr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "tokio",
@@ -2220,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "vpnmgr-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "reqwest",
@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "vpnmgr-ipc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde",
@@ -2245,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "vpnmgr-probe"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "boringtun",
  "futures-util",
@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "vpnmgr-tray"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "ksni",
@@ -2272,7 +2272,7 @@ dependencies = [
 
 [[package]]
 name = "vpnmgr-tunnel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "defguard_wireguard_rs",
  "thiserror 2.0.19",
@@ -2284,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "vpnmgrd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "serde_json",
