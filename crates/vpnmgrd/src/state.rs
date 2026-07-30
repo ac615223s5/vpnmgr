@@ -68,6 +68,10 @@ pub struct State {
     /// long-lived, and a stale figure from before a restart would be worth less
     /// than the complexity of storing it.
     throughput_seen: std::collections::HashMap<String, (f64, Instant)>,
+    /// What the connection itself managed with the tunnel down, from the last
+    /// `vpnmgr baseline`. Anchors the capacity term to the user's real line
+    /// rate instead of a guess.
+    direct_mbps: Option<f64>,
     /// Outcome of the most recent tuning pass, for `vpnmgr status`.
     last_tune: Option<String>,
     /// When the last pass ran; the schedule is measured from here so a manual
@@ -132,6 +136,7 @@ impl State {
             pending: None,
             dismissed: None,
             throughput_seen: std::collections::HashMap::new(),
+            direct_mbps: None,
             last_tune: None,
             last_tune_at: None,
         })
@@ -179,6 +184,17 @@ impl State {
         Ok(&self.servers.as_ref().expect("cached or just fetched").0)
     }
 
+    /// Ranking inputs, including the capacity target derived from this
+    /// machine's own measured throughput.
+    fn scoring(&self) -> score::Scoring {
+        score::Scoring::new(
+            self.config.autotune.weights,
+            self.config
+                .autotune
+                .headroom_target_mbps(self.direct_mbps),
+        )
+    }
+
     /// A prober configured for the current connection state.
     ///
     /// Two things matter here. The fwmark keeps probes on the physical path
@@ -196,7 +212,7 @@ impl State {
     /// Filter, probe and rank. The measurement path shared by connect and test.
     pub async fn sweep(&mut self, country: Option<String>) -> Result<Vec<RankedServer>> {
         let probe_settings = self.config.probe.clone();
-        let weights = self.config.autotune.weights;
+        let scoring = self.scoring();
         let mut filters = self.config.filters.clone();
         if let Some(country) = country {
             filters.country_whitelist = vec![country];
@@ -229,7 +245,7 @@ impl State {
 
         let probed = measured.len();
         let reachable = measured.iter().filter(|m| m.rtt.is_some()).count();
-        let ranked = score::rank(&measured, &weights);
+        let ranked = score::rank(&measured, &scoring);
 
         let best = ranked.first().map(|s| self.to_ranked(s));
         // Distinguishing "nothing reachable" from "nothing good" matters: the
@@ -298,7 +314,7 @@ impl State {
     async fn probe_named(&mut self, name: &str) -> Result<RankedServer> {
         let entries = airvpn::WG_ENTRIES;
         let port = self.config.provider.airvpn.port;
-        let weights = self.config.autotune.weights;
+        let scoring = self.scoring();
         let prober = self.prober();
 
         let list = self.server_list().await?;
@@ -307,7 +323,7 @@ impl State {
             .ok_or_else(|| Error::UnknownServer(name.to_owned()))?;
 
         let measured = sweep(&prober, &[server], &entries, port).await;
-        let ranked = score::rank(&measured, &weights);
+        let ranked = score::rank(&measured, &scoring);
         let chosen = ranked.first().map(|s| RankedServer {
             name: s.server.name.clone(),
             country_code: s.server.country_code.clone(),
@@ -556,6 +572,10 @@ impl State {
 
         let direct = direct?;
         restored?;
+
+        // The direct figure is this connection's own ceiling, so it anchors the
+        // capacity term from here on unless the user set target_mbps explicitly.
+        self.direct_mbps = Some(direct.mbps);
 
         let meets_target = tunnelled.mbps >= min_mbps;
         // A ratio is what answers the question; absolute numbers on their own

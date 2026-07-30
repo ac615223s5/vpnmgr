@@ -595,7 +595,7 @@ mod tests {
                 rtt: None,
             },
         ];
-        let ranked = vpnmgr_core::score::rank(&measured, &config::Weights::default());
+        let ranked = vpnmgr_core::score::rank(&measured, &vpnmgr_core::score::Scoring::default());
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].server.name, servers[0].name);
     }
@@ -613,7 +613,7 @@ mod tests {
         assert!(measured.iter().all(|m| m.rtt.is_none()));
         // An endpoint is still populated so callers never see a hole.
         assert!(measured.iter().all(|m| m.endpoint.port() == 9));
-        assert!(vpnmgr_core::score::rank(&measured, &config::Weights::default()).is_empty());
+        assert!(vpnmgr_core::score::rank(&measured, &vpnmgr_core::score::Scoring::default()).is_empty());
     }
 
     #[test]

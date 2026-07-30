@@ -148,6 +148,25 @@ pub struct Autotune {
     /// Throughput floor for the opt-in Tier-2 test.
     #[serde(default = "default_min_mbps")]
     pub min_mbps: f64,
+    /// Throughput you want the VPN to be able to sustain, in Mbit/s.
+    ///
+    /// Set this a little below your line rate: it is what you expect to get,
+    /// not the number on the bill. It anchors the capacity term in scoring —
+    /// a server needs `target_mbps * headroom_margin` free to score full marks.
+    ///
+    /// Left unset, the daemon uses whatever `vpnmgr baseline` last measured
+    /// directly on your own connection, shaded down slightly, and falls back to
+    /// a conservative default until one has run.
+    #[serde(default)]
+    pub target_mbps: Option<f64>,
+    /// How many times `target_mbps` a server should have spare before its
+    /// capacity stops counting against it.
+    ///
+    /// Above 1.0 because the figure is a fleet-wide average that moves, you are
+    /// not the only client arriving, and a server with exactly enough room for
+    /// you has none for anyone else.
+    #[serde(default = "default_headroom_margin")]
+    pub headroom_margin: f64,
     #[serde(default = "default_switch_policy")]
     pub switch_policy: SwitchPolicy,
     /// Fractional score improvement required to justify a switch, 0.0–1.0.
@@ -216,6 +235,16 @@ fn default_max_latency() -> u32 {
 fn default_min_mbps() -> f64 {
     50.0
 }
+/// Used only until a baseline measurement exists. Deliberately conservative:
+/// with the default margin it reproduces the 1 Gbit/s saturation point this
+/// replaced, so an unconfigured install behaves as before.
+pub const DEFAULT_TARGET_MBPS: f64 = 500.0;
+/// What fraction of a measured direct throughput to treat as the target.
+/// "A bit below the maximum" — the peak is not what you sustain.
+pub const MEASURED_TARGET_FRACTION: f64 = 0.9;
+fn default_headroom_margin() -> f64 {
+    2.0
+}
 fn default_switch_policy() -> SwitchPolicy {
     SwitchPolicy::Ask
 }
@@ -271,6 +300,8 @@ impl Default for Autotune {
             interval_minutes: default_interval(),
             max_latency_ms: default_max_latency(),
             min_mbps: default_min_mbps(),
+            target_mbps: None,
+            headroom_margin: default_headroom_margin(),
             switch_policy: default_switch_policy(),
             improvement_threshold: default_improvement(),
             weights: Weights::default(),
@@ -332,6 +363,24 @@ impl Default for Probe {
 impl Autotune {
     pub fn interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.interval_minutes * 60)
+    }
+
+    /// Spare capacity at which a server scores full marks, in Mbit/s.
+    ///
+    /// `measured_direct_mbps` is what the connection itself managed with the
+    /// tunnel down, if that has ever been measured. An explicit `target_mbps`
+    /// always wins over it.
+    pub fn headroom_target_mbps(&self, measured_direct_mbps: Option<f64>) -> f64 {
+        let target = self
+            .target_mbps
+            .or_else(|| {
+                measured_direct_mbps
+                    .filter(|m| *m > 0.0)
+                    .map(|m| m * MEASURED_TARGET_FRACTION)
+            })
+            .unwrap_or(DEFAULT_TARGET_MBPS);
+        // Never zero: it divides the headroom ratio.
+        (target * self.headroom_margin).max(1.0)
     }
 }
 
@@ -413,6 +462,16 @@ impl Config {
         if self.autotune.interval_minutes == 0 {
             return Err(Error::Config(
                 "autotune.interval_minutes must be greater than 0".into(),
+            ));
+        }
+        if self.autotune.target_mbps.is_some_and(|t| t <= 0.0) {
+            return Err(Error::Config(
+                "autotune.target_mbps must be greater than 0 when set".into(),
+            ));
+        }
+        if self.autotune.headroom_margin <= 0.0 {
+            return Err(Error::Config(
+                "autotune.headroom_margin must be greater than 0".into(),
             ));
         }
         if !(0.0..=1.0).contains(&self.autotune.improvement_threshold) {
@@ -545,6 +604,38 @@ peer_public_key = "PyLCXAQT8KkM4T+dUsOQfn+Ub3pGxfGlxkIApuig+hk="
             again.provider.airvpn.peer_public_key.to_base64(),
             original.provider.airvpn.peer_public_key.to_base64()
         );
+    }
+
+    /// Unset, the target comes from whatever the connection itself managed,
+    /// shaded down — "a bit below the maximum" rather than the peak.
+    #[test]
+    fn the_headroom_target_follows_a_measured_connection() {
+        let c = parse(MINIMAL).unwrap();
+        let unmeasured = c.autotune.headroom_target_mbps(None);
+        let measured = c.autotune.headroom_target_mbps(Some(1000.0));
+        assert_eq!(unmeasured, DEFAULT_TARGET_MBPS * 2.0);
+        assert_eq!(measured, 1000.0 * MEASURED_TARGET_FRACTION * 2.0);
+        assert!(
+            measured > unmeasured,
+            "a gigabit line should demand more of a server than the default"
+        );
+    }
+
+    #[test]
+    fn an_explicit_target_overrides_the_measurement() {
+        let text = format!("{MINIMAL}\n[autotune]\ntarget_mbps = 100.0\n");
+        let c = parse(&text).unwrap();
+        // The measurement is ignored entirely once the user has said what they
+        // want; otherwise configuring it would not be dependable.
+        assert_eq!(c.autotune.headroom_target_mbps(Some(5000.0)), 200.0);
+    }
+
+    #[test]
+    fn rejects_a_nonsensical_target() {
+        let text = format!("{MINIMAL}\n[autotune]\ntarget_mbps = 0.0\n");
+        assert!(parse(&text).unwrap_err().to_string().contains("greater than 0"));
+        let text = format!("{MINIMAL}\n[autotune]\nheadroom_margin = 0.0\n");
+        assert!(parse(&text).unwrap_err().to_string().contains("greater than 0"));
     }
 
     #[test]

@@ -8,6 +8,11 @@
 //! `bw / bw_max`, so weighting both counted utilisation twice under two names,
 //! and the nominal 0.6/0.3/0.1 split was really 0.6/0.4.
 //!
+//! Headroom is measured against what the *user* can actually use — their target
+//! throughput times a safety margin — rather than an absolute figure, and is
+//! scored on a log curve for the same reason latency is: the first few hundred
+//! Mbit/s of spare capacity matter far more than the next few thousand.
+//!
 //! RTT is scored *relative to the fastest candidate* rather than against an
 //! absolute scale, because what counts as a good RTT depends entirely on where
 //! the user is. It is scored on the logarithm of that ratio, which took two
@@ -43,13 +48,36 @@ use crate::config::Weights;
 /// equally distant servers is meaningless — load and headroom should decide.
 const RTT_RATIO_FLOOR: f64 = 20.0;
 
-/// Headroom past this point stops counting, in Mbit/s.
+/// Everything the ranking needs beyond the measurements themselves.
 ///
-/// Spare capacity only helps until it exceeds what the user's own connection
-/// can pull; a server with 12 Gbit/s free is not better than one with 2 Gbit/s
-/// free for anyone on a domestic link. Capping keeps this a penalty for
-/// servers running out of room rather than a bonus for large ones.
-const HEADROOM_ENOUGH_MBPS: f64 = 1000.0;
+/// Bundled rather than passed loose because the capacity term is anchored to
+/// the user's own connection speed, so it is not a constant the way it looks.
+#[derive(Debug, Clone)]
+pub struct Scoring {
+    /// Relative importance of each signal.
+    pub weights: Weights,
+    /// Spare capacity at which a server scores full marks on capacity, in
+    /// Mbit/s. Derived from `autotune.target_mbps * autotune.headroom_margin`.
+    pub headroom_target_mbps: f64,
+}
+
+impl Default for Scoring {
+    fn default() -> Self {
+        Self {
+            weights: Weights::default(),
+            headroom_target_mbps: crate::config::DEFAULT_TARGET_MBPS * 2.0,
+        }
+    }
+}
+
+impl Scoring {
+    pub fn new(weights: Weights, headroom_target_mbps: f64) -> Self {
+        Self {
+            weights,
+            headroom_target_mbps,
+        }
+    }
+}
 
 /// A server together with its probe result.
 ///
@@ -87,7 +115,8 @@ pub struct Scored<'a> {
 ///
 /// Unreachable servers are omitted. Ties break on RTT, then on name, so the
 /// ordering is deterministic and the tuner does not flap between equals.
-pub fn rank<'a>(measured: &[Measured<'a>], weights: &Weights) -> Vec<Scored<'a>> {
+pub fn rank<'a>(measured: &[Measured<'a>], scoring: &Scoring) -> Vec<Scored<'a>> {
+    let weights = &scoring.weights;
     let reachable: Vec<(&Server, SocketAddr, u8, Duration)> = measured
         .iter()
         .filter_map(|m| m.rtt.map(|rtt| (m.server, m.endpoint, m.entry, rtt)))
@@ -119,8 +148,17 @@ pub fn rank<'a>(measured: &[Measured<'a>], weights: &Weights) -> Vec<Scored<'a>>
                 (1.0 - ratio.ln() / RTT_RATIO_FLOOR.ln()).clamp(0.0, 1.0)
             };
             let load_score = 1.0 - server.load_fraction();
-            let headroom_score =
-                (server.headroom_mbps() as f64 / HEADROOM_ENOUGH_MBPS).clamp(0.0, 1.0);
+            // Log for the same reason as latency: the first few hundred Mbit/s
+            // of spare capacity matter far more than the next few thousand, and
+            // a linear ramp prices them the same. Full marks at the target,
+            // and nothing beyond it, because capacity you cannot use is not an
+            // advantage.
+            let headroom_score = if scoring.headroom_target_mbps <= 0.0 {
+                1.0
+            } else {
+                let ratio = server.headroom_mbps() as f64 / scoring.headroom_target_mbps;
+                ((1.0 + ratio).ln() / std::f64::consts::LN_2).clamp(0.0, 1.0)
+            };
 
             let score = (weights.rtt * rtt_score
                 + weights.load * load_score
@@ -211,7 +249,7 @@ mod tests {
             measured(pair[0], ms(90)),
             measured(pair[1], ms(12)),
         ];
-        let ranked = rank(&measured, &Weights::default());
+        let ranked = rank(&measured, &Scoring::default());
         assert_eq!(ranked[0].server.name, pair[1].name);
     }
 
@@ -224,7 +262,7 @@ mod tests {
             measured(servers[1], None),
             measured(servers[2], ms(40)),
         ];
-        let ranked = rank(&measured, &Weights::default());
+        let ranked = rank(&measured, &Scoring::default());
         assert_eq!(ranked.len(), 2);
         assert!(ranked.iter().all(|s| s.server.name != servers[1].name));
     }
@@ -237,7 +275,7 @@ mod tests {
             .take(5)
             .map(|server| measured(server, None))
             .collect();
-        assert!(rank(&measured, &Weights::default()).is_empty());
+        assert!(rank(&measured, &Scoring::default()).is_empty());
     }
 
     #[test]
@@ -248,7 +286,7 @@ mod tests {
             .enumerate()
             .map(|(i, server)| measured(server, ms(10 + i as u64)))
             .collect();
-        let ranked = rank(&measured, &Weights::default());
+        let ranked = rank(&measured, &Scoring::default());
         assert_eq!(ranked.len(), 243);
         assert!(ranked.iter().all(|s| (0.0..=1.0).contains(&s.score)));
     }
@@ -257,7 +295,7 @@ mod tests {
     fn a_single_candidate_is_not_penalised_for_having_no_peers() {
         let list = list();
         let server = list.healthy().next().unwrap();
-        let ranked = rank(&[measured(server, ms(200))], &Weights::default());
+        let ranked = rank(&[measured(server, ms(200))], &Scoring::default());
         // A lone candidate has no spread to compare against, so RTT is neutral.
         assert_eq!(ranked[0].rtt_score, 1.0);
     }
@@ -290,7 +328,7 @@ mod tests {
 
         // The heavier server is 4.5x closer, which is what should decide it.
         let measured = vec![measured(light, ms(28)), measured(heavy, ms(6))];
-        let ranked = rank(&measured, &Weights::default());
+        let ranked = rank(&measured, &Scoring::default());
         assert_eq!(
             ranked[0].server.name, heavy.name,
             "a 4.5x latency advantage should beat a {}-point load gap",
@@ -318,7 +356,7 @@ mod tests {
         assert_eq!(saturated.headroom_mbps(), 0, "expected no capacity left");
 
         let measured = vec![measured(idle, ms(28)), measured(saturated, ms(6))];
-        let ranked = rank(&measured, &Weights::default());
+        let ranked = rank(&measured, &Scoring::default());
         assert_eq!(
             ranked[0].server.name, idle.name,
             "a fully saturated server should not win on proximity alone"
@@ -335,7 +373,7 @@ mod tests {
 
         let pair = rank(
             &[measured(servers[0], ms(10)), measured(servers[1], ms(20))],
-            &Weights::default(),
+            &Scoring::default(),
         );
         let with_outlier = rank(
             &[
@@ -343,7 +381,7 @@ mod tests {
                 measured(servers[1], ms(20)),
                 measured(servers[2], ms(500)),
             ],
-            &Weights::default(),
+            &Scoring::default(),
         );
 
         let score_of = |ranked: &[Scored], name: &str| {
@@ -376,7 +414,7 @@ mod tests {
                 measured(servers[2], ms(100)),
                 measured(servers[3], ms(200)),
             ],
-            &Weights::default(),
+            &Scoring::default(),
         );
         let rtt_of = |name: &str| {
             ranked
@@ -412,7 +450,7 @@ mod tests {
 
         let ranked = rank(
             &[measured(small, ms(10)), measured(large, ms(10))],
-            &Weights::default(),
+            &Scoring::default(),
         );
         let of = |name: &str| {
             ranked
@@ -449,7 +487,7 @@ mod tests {
 
         let ranked = rank(
             &[measured(scarce, ms(10)), measured(ample, ms(10))],
-            &Weights::default(),
+            &Scoring::default(),
         );
         let of = |name: &str| {
             ranked
@@ -464,6 +502,81 @@ mod tests {
         );
     }
 
+    /// The capacity curve is anchored to what the user can actually use, so
+    /// the same server scores differently for a gigabit line and a slow one.
+    #[test]
+    fn the_headroom_target_moves_the_capacity_score() {
+        let list = list();
+        let server = list
+            .servers
+            .iter()
+            .find(|s| s.headroom_mbps() > 500 && s.headroom_mbps() < 1500)
+            .expect("fixture has a mid-headroom server");
+
+        let head = |target: f64| {
+            rank(
+                &[measured(server, ms(10))],
+                &Scoring::new(Weights::default(), target),
+            )[0]
+                .headroom_score
+        };
+        // A modest target is easily satisfied; a demanding one is not.
+        assert!(
+            head(200.0) > head(4000.0),
+            "a server should look better to someone who needs less from it"
+        );
+        assert!(head(200.0) >= 0.99, "well past the target should be full marks");
+    }
+
+    /// Log-shaped like latency: the first slice of spare capacity is worth more
+    /// than the last, so a linear ramp would undervalue partial headroom.
+    #[test]
+    fn capacity_has_diminishing_returns() {
+        let list = list();
+        let server = list
+            .servers
+            .iter()
+            .max_by_key(|s| s.headroom_mbps())
+            .expect("fixture has servers");
+        let h = server.headroom_mbps() as f64;
+
+        let head = |target: f64| {
+            rank(
+                &[measured(server, ms(10))],
+                &Scoring::new(Weights::default(), target),
+            )[0]
+                .headroom_score
+        };
+        // Headroom at a quarter of target already earns well over a quarter of
+        // the score; that concavity is the whole point of the log.
+        let quarter = head(h * 4.0);
+        assert!(
+            quarter > 0.25,
+            "a quarter of the target scored {quarter:.3}, no better than linear"
+        );
+        assert!(quarter < 1.0);
+        // And the target itself is exactly full marks, not merely close.
+        assert!((head(h) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_capacity_left_scores_zero_however_the_target_is_set() {
+        let list = list();
+        let full = list
+            .servers
+            .iter()
+            .find(|s| s.headroom_mbps() == 0)
+            .expect("fixture has a saturated server");
+        for target in [100.0, 1000.0, 10_000.0] {
+            let score = rank(
+                &[measured(full, ms(10))],
+                &Scoring::new(Weights::default(), target),
+            )[0]
+                .headroom_score;
+            assert_eq!(score, 0.0, "target {target} gave {score}");
+        }
+    }
+
     #[test]
     fn load_decides_when_latency_is_identical() {
         let list = list();
@@ -475,7 +588,7 @@ mod tests {
             measured(heavy, ms(25)),
             measured(light, ms(25)),
         ];
-        let ranked = rank(&measured, &Weights::default());
+        let ranked = rank(&measured, &Scoring::default());
         assert_eq!(ranked[0].server.name, light.name);
     }
 
@@ -486,7 +599,10 @@ mod tests {
         healthy.sort_by_key(|s| s.load);
         let (light, heavy) = (healthy[0], healthy[healthy.len() - 1]);
         // Ignore load entirely: the slower-but-lighter server should lose.
-        let rtt_only = Weights { rtt: 1.0, load: 0.0, headroom: 0.0 };
+        let rtt_only = Scoring::new(
+            Weights { rtt: 1.0, load: 0.0, headroom: 0.0 },
+            Scoring::default().headroom_target_mbps,
+        );
         let measured = vec![
             measured(light, ms(200)),
             measured(heavy, ms(10)),
@@ -503,8 +619,8 @@ mod tests {
             .iter()
             .map(|server| measured(server, ms(50)))
             .collect();
-        let first = rank(&measured, &Weights::default());
-        let second = rank(&measured, &Weights::default());
+        let first = rank(&measured, &Scoring::default());
+        let second = rank(&measured, &Scoring::default());
         let names = |v: &[Scored]| v.iter().map(|s| s.server.name.clone()).collect::<Vec<_>>();
         assert_eq!(names(&first), names(&second));
     }

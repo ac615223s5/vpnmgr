@@ -37,7 +37,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use vpnmgr_core::airvpn::{self, Client, Server};
-use vpnmgr_core::config::{Filters, Probe, Weights};
+use vpnmgr_core::config::{Filters, Probe};
 use vpnmgr_core::wgconf::ClientConfig;
 use vpnmgr_core::{filter, score};
 use vpnmgr_probe::{Prober, sweep};
@@ -99,7 +99,7 @@ async fn main() {
         airvpn::WG_PORT,
     )
     .await;
-    let ranked = score::rank(&measured, &Weights::default());
+    let ranked = score::rank(&measured, &score::Scoring::default());
 
     // Re-probe the top few on each entry individually: we need a server that
     // answers on entry 1 *and* entry 3, otherwise there is nothing to test.

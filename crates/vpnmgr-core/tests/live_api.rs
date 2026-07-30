@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use vpnmgr_core::airvpn::{self, Client};
-use vpnmgr_core::config::{Filters, Weights};
+use vpnmgr_core::config::Filters;
 use vpnmgr_core::{filter, render, score};
 
 #[tokio::test]
@@ -81,7 +81,7 @@ async fn the_full_pipeline_produces_a_ranked_swedish_shortlist() {
         })
         .collect();
 
-    let ranked = score::rank(&measured, &Weights::default());
+    let ranked = score::rank(&measured, &score::Scoring::default());
     assert_eq!(ranked.len(), selection.accepted.len());
     // rank() must return best-first.
     assert!(ranked.windows(2).all(|w| w[0].score >= w[1].score));
