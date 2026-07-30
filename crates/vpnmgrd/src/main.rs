@@ -181,8 +181,16 @@ async fn handle(request: Request, state: &Arc<Mutex<State>>) -> Response {
 
         Request::Connect { server } => match state.connect(server).await {
             Ok(chosen) => Response::ok(format!(
-                "connected to {} ({}, {}) via entry {} at {:.1}ms",
-                chosen.name, chosen.location, chosen.country_name, chosen.entry, chosen.rtt_ms
+                "connected to {} ({}, {}) via entry {} at {:.1}ms{}",
+                chosen.name,
+                chosen.location,
+                chosen.country_name,
+                chosen.entry,
+                chosen.rtt_ms,
+                match chosen.mbps {
+                    Some(mbps) => format!(", measured {mbps:.0} Mbps"),
+                    None => String::new(),
+                }
             )),
             Err(e) => Response::error(e),
         },

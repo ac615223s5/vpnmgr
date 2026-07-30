@@ -34,6 +34,11 @@ const MAX_HANDSHAKE_AGE: Duration = Duration::from_secs(360);
 /// within a working day.
 const DISMISSAL_COOLDOWN: Duration = Duration::from_secs(4 * 60 * 60);
 
+/// How long to wait for a retargeted tunnel to complete a handshake before
+/// giving up on a candidate. Generous, because a switch rotates the listen
+/// port and the new server has to be found again.
+const CANDIDATE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What the daemon is currently connected to.
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -42,6 +47,18 @@ pub struct Connection {
     pub country_code: String,
     pub endpoint: std::net::SocketAddr,
     pub entry: u8,
+}
+
+impl From<&RankedServer> for Connection {
+    fn from(s: &RankedServer) -> Self {
+        Self {
+            server: s.name.clone(),
+            location: s.location.clone(),
+            country_code: s.country_code.clone(),
+            endpoint: s.endpoint,
+            entry: s.entry,
+        }
+    }
 }
 
 pub struct State {
@@ -281,16 +298,19 @@ impl State {
             return Err(Error::AlreadyConnected(current.server.clone()));
         }
 
-        let chosen = match server {
-            Some(name) => self.probe_named(&name).await?,
-            None => self
-                .sweep(None)
-                .await?
-                .into_iter()
-                .next()
-                .ok_or(Error::AllUnreachable { probed: 0 })?,
+        // A named server is the user's decision, so it is taken at face value.
+        // Only automatic selection second-guesses itself by measuring.
+        let Some(name) = server else {
+            return self.connect_best().await;
         };
 
+        let chosen = self.probe_named(&name).await?;
+        self.establish(&chosen)?;
+        Ok(chosen)
+    }
+
+    /// Bring the tunnel up on `chosen`.
+    fn establish(&mut self, chosen: &RankedServer) -> Result<()> {
         let spec = TunnelSpec::new(&self.client, chosen.endpoint)
             .with_interface(vpnmgr_tunnel::DEFAULT_INTERFACE)
             .with_fwmark(DEFAULT_FWMARK);
@@ -299,15 +319,170 @@ impl State {
         tunnel.up(&spec)?;
 
         self.tunnel = Some(tunnel);
-        self.current = Some(Connection {
-            server: chosen.name.clone(),
-            location: chosen.location.clone(),
-            country_code: chosen.country_code.clone(),
-            endpoint: chosen.endpoint,
-            entry: chosen.entry,
-        });
+        self.current = Some(Connection::from(chosen));
         tracing::info!(server = %chosen.name, endpoint = %chosen.endpoint, "connected");
-        Ok(chosen)
+        Ok(())
+    }
+
+    /// Retarget an existing tunnel at `chosen`, without re-probing it.
+    fn move_to(&mut self, chosen: &RankedServer) -> Result<()> {
+        let spec = TunnelSpec::new(&self.client, chosen.endpoint)
+            .with_interface(vpnmgr_tunnel::DEFAULT_INTERFACE)
+            .with_fwmark(DEFAULT_FWMARK);
+
+        let tunnel = self.tunnel.as_mut().ok_or(Error::NotConnected)?;
+        tunnel.switch_endpoint(&spec)?;
+        self.current = Some(Connection::from(chosen));
+        Ok(())
+    }
+
+    /// Wait for a handshake newer than `since`, so a measurement is not taken
+    /// against a tunnel that is not carrying traffic yet.
+    ///
+    /// A freshly retargeted tunnel needs a few seconds before data flows, and
+    /// measuring inside that window reads as "this server is terrible" when it
+    /// is really "this server has not answered yet".
+    async fn wait_until_carrying(&self, since: SystemTime, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(tunnel) = &self.tunnel
+                && let Ok(status) = tunnel.status()
+                && status.last_handshake.is_some_and(|at| at > since)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        false
+    }
+
+    /// Pick a server by measuring, not just by predicting.
+    ///
+    /// Ranking says which servers *should* be fast. This connects to the best
+    /// few in turn and keeps the first that actually delivers `min_mbps`,
+    /// because a server can be close, idle and still slow — and nothing short
+    /// of routing traffic through it will reveal that.
+    ///
+    /// Stops at the first success, so the common case costs one measurement.
+    /// If none clear the bar it settles on whichever measured fastest, which is
+    /// still a better-informed choice than the top of the ranking.
+    async fn connect_best(&mut self) -> Result<RankedServer> {
+        let ranked = self.sweep(None).await?;
+        let target = self.config.autotune.min_mbps;
+        let attempts = self.config.autotune.verify_candidates.min(ranked.len());
+
+        let mut candidates = ranked.into_iter();
+        let Some(first) = candidates.next() else {
+            return Err(Error::AllUnreachable { probed: 0 });
+        };
+
+        // Verification turned off, or nothing to choose between: trust the rank.
+        if attempts == 0 {
+            self.establish(&first)?;
+            return Ok(first);
+        }
+
+        let shortlist: Vec<RankedServer> = std::iter::once(first)
+            .chain(candidates)
+            .take(attempts)
+            .collect();
+
+        let settings = vpnmgr_probe::throughput::Settings {
+            url: self
+                .config
+                .throughput
+                .request_url_for(self.config.throughput.select_bytes),
+            bytes: self.config.throughput.select_bytes,
+            timeout: Duration::from_secs(self.config.throughput.timeout_secs),
+        };
+
+        let mut best: Option<(RankedServer, f64)> = None;
+
+        for (index, candidate) in shortlist.iter().enumerate() {
+            let since = SystemTime::now();
+            if index == 0 {
+                self.establish(candidate)?;
+            } else {
+                self.move_to(candidate)?;
+            }
+
+            if !self
+                .wait_until_carrying(since, CANDIDATE_READY_TIMEOUT)
+                .await
+            {
+                tracing::warn!(
+                    server = %candidate.name,
+                    "no handshake after retargeting; skipping this candidate"
+                );
+                continue;
+            }
+
+            let sample = match measure(&settings).await {
+                Ok(sample) => sample,
+                Err(e) => {
+                    tracing::warn!(server = %candidate.name, "could not measure: {e}");
+                    continue;
+                }
+            };
+            self.record_throughput(&candidate.name, sample.mbps);
+
+            tracing::info!(
+                server = %candidate.name,
+                mbps = format!("{:.1}", sample.mbps),
+                target = format!("{target:.0}"),
+                candidate = index + 1,
+                of = shortlist.len(),
+                "measured a candidate"
+            );
+
+            if sample.mbps >= target {
+                let mut chosen = candidate.clone();
+                chosen.mbps = Some(sample.mbps);
+                chosen.mbps_age_secs = Some(0);
+                tracing::info!(
+                    server = %chosen.name,
+                    "settled after {} of {} candidates",
+                    index + 1,
+                    shortlist.len()
+                );
+                return Ok(chosen);
+            }
+
+            if best.as_ref().is_none_or(|(_, mbps)| sample.mbps > *mbps) {
+                best = Some((candidate.clone(), sample.mbps));
+            }
+        }
+
+        // Nothing cleared the bar. Settle on the best measured rather than
+        // leaving the user on whichever candidate happened to be tried last.
+        match best {
+            Some((server, mbps)) => {
+                tracing::warn!(
+                    "no candidate reached {target:.0} Mbps; settling on {} at {mbps:.1} Mbps",
+                    server.name
+                );
+                if self
+                    .current
+                    .as_ref()
+                    .is_none_or(|c| c.server != server.name)
+                {
+                    self.move_to(&server)?;
+                }
+                let mut chosen = server;
+                chosen.mbps = Some(mbps);
+                chosen.mbps_age_secs = Some(0);
+                Ok(chosen)
+            }
+            // Every candidate failed to come up or measure; the tunnel is
+            // pointed at the last one tried, which is the best we can say.
+            None => {
+                let fallback = shortlist.into_iter().next().expect("shortlist is non-empty");
+                if self.current.is_none() {
+                    self.establish(&fallback)?;
+                }
+                Ok(fallback)
+            }
+        }
     }
 
     /// Probe one named server's entries and return the faster.

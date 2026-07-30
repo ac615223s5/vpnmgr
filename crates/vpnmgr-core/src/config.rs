@@ -50,6 +50,14 @@ pub struct Throughput {
     pub bytes: u64,
     #[serde(default = "default_throughput_timeout")]
     pub timeout_secs: u64,
+    /// Payload for the measurements taken while choosing a server, in bytes.
+    ///
+    /// Smaller than `bytes` on purpose: picking between candidates needs a
+    /// rough figure, not a precise one, and this may run several times in a row.
+    /// Still large enough to clear TCP slow start, which the first couple of
+    /// megabytes are spent on.
+    #[serde(default = "default_select_bytes")]
+    pub select_bytes: u64,
 }
 
 /// Refuse to let traffic leave outside the tunnel.
@@ -167,6 +175,16 @@ pub struct Autotune {
     /// you has none for anyone else.
     #[serde(default = "default_headroom_margin")]
     pub headroom_margin: f64,
+    /// How many of the best-ranked servers to actually connect to and measure
+    /// before settling, when picking a server automatically.
+    ///
+    /// Ranking is a prediction from latency and reported capacity; this checks
+    /// it against reality, because a server can be close and idle and still be
+    /// slow. The first candidate to clear `min_mbps` wins, so the usual cost is
+    /// one measurement, not this many. Set to 0 to trust the ranking and skip
+    /// measuring entirely.
+    #[serde(default = "default_verify_candidates")]
+    pub verify_candidates: usize,
     #[serde(default = "default_switch_policy")]
     pub switch_policy: SwitchPolicy,
     /// Fractional score improvement required to justify a switch, 0.0–1.0.
@@ -252,6 +270,9 @@ pub const MEASURED_TARGET_FRACTION: f64 = 0.9;
 fn default_headroom_margin() -> f64 {
     2.0
 }
+fn default_verify_candidates() -> usize {
+    5
+}
 fn default_switch_policy() -> SwitchPolicy {
     SwitchPolicy::Ask
 }
@@ -288,6 +309,9 @@ fn default_throughput_bytes() -> u64 {
 fn default_throughput_timeout() -> u64 {
     30
 }
+fn default_select_bytes() -> u64 {
+    8_000_000
+}
 
 impl Default for Filters {
     fn default() -> Self {
@@ -309,6 +333,7 @@ impl Default for Autotune {
             min_mbps: default_min_mbps(),
             target_mbps: None,
             headroom_margin: default_headroom_margin(),
+            verify_candidates: default_verify_candidates(),
             switch_policy: default_switch_policy(),
             improvement_threshold: default_improvement(),
             weights: Weights::default(),
@@ -341,6 +366,7 @@ impl Default for Throughput {
             url: default_throughput_url(),
             bytes: default_throughput_bytes(),
             timeout_secs: default_throughput_timeout(),
+            select_bytes: default_select_bytes(),
         }
     }
 }
@@ -349,8 +375,13 @@ impl Throughput {
     /// The full request URL. The byte count is appended when the configured
     /// URL ends in `=`, which is the shape the default endpoint takes.
     pub fn request_url(&self) -> String {
+        self.request_url_for(self.bytes)
+    }
+
+    /// The same, for an arbitrary payload size.
+    pub fn request_url_for(&self, bytes: u64) -> String {
         if self.url.ends_with('=') {
-            format!("{}{}", self.url, self.bytes)
+            format!("{}{bytes}", self.url)
         } else {
             self.url.clone()
         }
