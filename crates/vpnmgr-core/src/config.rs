@@ -179,6 +179,13 @@ pub struct Autotune {
 
 /// Relative importance of each ranking signal. Normalised before use, so only
 /// the ratios matter.
+///
+/// Capacity outweighs load because the two overlap and headroom is the better
+/// of the pair: `load` is a raw utilisation percentage, while headroom is the
+/// same utilisation expressed against what *this* machine needs, so it already
+/// accounts for a server's size. Load is kept at a low weight as a tiebreaker
+/// for servers whose headroom is comfortably past the target and therefore
+/// tied at full marks.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Weights {
@@ -264,10 +271,10 @@ fn default_w_rtt() -> f64 {
     0.6
 }
 fn default_w_load() -> f64 {
-    0.3
+    0.1
 }
 fn default_w_headroom() -> f64 {
-    0.1
+    0.3
 }
 fn default_allow_lan() -> bool {
     true

@@ -6,7 +6,7 @@
 //! Capacity is scored as *absolute* headroom rather than as the spare-bandwidth
 //! fraction. The fraction was redundant: AirVPN's `currentload` is itself
 //! `bw / bw_max`, so weighting both counted utilisation twice under two names,
-//! and the nominal 0.6/0.3/0.1 split was really 0.6/0.4.
+//! and the nominal split was really 0.6 latency / 0.4 utilisation.
 //!
 //! Headroom is measured against what the *user* can actually use — their target
 //! throughput times a safety margin — rather than an absolute figure, and is
