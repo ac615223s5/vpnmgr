@@ -33,7 +33,14 @@ pub enum Request {
     /// Current tunnel state.
     Status,
     /// Connect, picking the best server when `server` is `None`.
-    Connect { server: Option<String> },
+    ///
+    /// `measure` chooses whether to test the connection and the candidates
+    /// before settling; `None` follows `autotune.measure_before_connect`.
+    Connect {
+        server: Option<String>,
+        #[serde(default)]
+        measure: Option<bool>,
+    },
     Disconnect,
     /// Move an existing tunnel to a different server.
     Switch { server: String },
@@ -331,9 +338,17 @@ mod tests {
     #[test]
     fn requests_round_trip() {
         roundtrip(Request::Status);
-        roundtrip(Request::Connect { server: None });
+        roundtrip(Request::Connect {
+            server: None,
+            measure: None,
+        });
         roundtrip(Request::Connect {
             server: Some("Kornephoros".into()),
+            measure: Some(true),
+        });
+        roundtrip(Request::Connect {
+            server: None,
+            measure: Some(false),
         });
         roundtrip(Request::Disconnect);
         roundtrip(Request::Switch {

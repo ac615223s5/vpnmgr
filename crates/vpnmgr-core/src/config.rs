@@ -183,9 +183,30 @@ pub struct Autotune {
     /// Above this round-trip time the current server counts as degraded.
     #[serde(default = "default_max_latency")]
     pub max_latency_ms: u32,
-    /// Throughput floor for the opt-in Tier-2 test.
+    /// Absolute throughput floor, in Mbit/s.
+    ///
+    /// A server delivering less than this is rejected however modest the
+    /// target is. It is a backstop, not the usual bar — see `accept_fraction`.
     #[serde(default = "default_min_mbps")]
     pub min_mbps: f64,
+    /// Fraction of `target_mbps` a server must deliver to be accepted when
+    /// choosing automatically.
+    ///
+    /// Below 1.0 deliberately. Demanding the full target would mean rejecting
+    /// servers for the ordinary overhead of tunnelling and for any transient
+    /// congestion, so a connect would work through every candidate and settle
+    /// on whichever happened to be least bad.
+    #[serde(default = "default_accept_fraction")]
+    pub accept_fraction: f64,
+    /// Measure the connection itself, with no tunnel up, before connecting.
+    ///
+    /// This is what calibrates `target_mbps` to the real line rate, so the
+    /// acceptance bar means something on this machine rather than being a
+    /// guess. It costs one short download and exposes nothing: the tunnel is
+    /// already down at that point, which is exactly why it is a *direct*
+    /// measurement.
+    #[serde(default = "default_true")]
+    pub measure_before_connect: bool,
     /// Throughput you want the VPN to be able to sustain, in Mbit/s.
     ///
     /// Set this a little below your line rate: it is what you expect to get,
@@ -290,6 +311,9 @@ fn default_max_latency() -> u32 {
 fn default_min_mbps() -> f64 {
     50.0
 }
+fn default_accept_fraction() -> f64 {
+    0.6
+}
 /// Used only until a baseline measurement exists. Deliberately conservative:
 /// with the default margin it reproduces the 1 Gbit/s saturation point this
 /// replaced, so an unconfigured install behaves as before.
@@ -364,6 +388,8 @@ impl Default for Autotune {
             interval_minutes: default_interval(),
             max_latency_ms: default_max_latency(),
             min_mbps: default_min_mbps(),
+            accept_fraction: default_accept_fraction(),
+            measure_before_connect: true,
             target_mbps: None,
             headroom_margin: default_headroom_margin(),
             verify_candidates: default_verify_candidates(),
@@ -446,22 +472,34 @@ impl Autotune {
         std::time::Duration::from_secs(self.interval_minutes * 60)
     }
 
-    /// Spare capacity at which a server scores full marks, in Mbit/s.
+    /// Throughput to aim for, in Mbit/s.
     ///
     /// `measured_direct_mbps` is what the connection itself managed with the
     /// tunnel down, if that has ever been measured. An explicit `target_mbps`
-    /// always wins over it.
-    pub fn headroom_target_mbps(&self, measured_direct_mbps: Option<f64>) -> f64 {
-        let target = self
-            .target_mbps
+    /// always wins over it, so configuring it stays dependable.
+    pub fn target_mbps(&self, measured_direct_mbps: Option<f64>) -> f64 {
+        self.target_mbps
             .or_else(|| {
                 measured_direct_mbps
                     .filter(|m| *m > 0.0)
                     .map(|m| m * MEASURED_TARGET_FRACTION)
             })
-            .unwrap_or(DEFAULT_TARGET_MBPS);
+            .unwrap_or(DEFAULT_TARGET_MBPS)
+    }
+
+    /// Spare capacity at which a server scores full marks, in Mbit/s.
+    pub fn headroom_target_mbps(&self, measured_direct_mbps: Option<f64>) -> f64 {
         // Never zero: it divides the headroom ratio.
-        (target * self.headroom_margin).max(1.0)
+        (self.target_mbps(measured_direct_mbps) * self.headroom_margin).max(1.0)
+    }
+
+    /// Throughput a server must actually deliver to be accepted.
+    ///
+    /// A fraction of the target, floored at `min_mbps`. The floor matters on a
+    /// slow connection, where a fraction of an already-small target would
+    /// accept almost anything.
+    pub fn acceptance_mbps(&self, measured_direct_mbps: Option<f64>) -> f64 {
+        (self.target_mbps(measured_direct_mbps) * self.accept_fraction).max(self.min_mbps)
     }
 }
 
@@ -549,6 +587,12 @@ impl Config {
             return Err(Error::Config(
                 "autotune.target_mbps must be greater than 0 when set".into(),
             ));
+        }
+        if !(0.0..=1.0).contains(&self.autotune.accept_fraction) {
+            return Err(Error::Config(format!(
+                "autotune.accept_fraction = {} must be between 0.0 and 1.0",
+                self.autotune.accept_fraction
+            )));
         }
         if self.autotune.headroom_margin <= 0.0 {
             return Err(Error::Config(
@@ -700,6 +744,38 @@ peer_public_key = "PyLCXAQT8KkM4T+dUsOQfn+Ub3pGxfGlxkIApuig+hk="
         assert!(
             measured > unmeasured,
             "a gigabit line should demand more of a server than the default"
+        );
+    }
+
+    /// The bar follows the line rate, so it means something on this machine
+    /// rather than being a fixed guess.
+    #[test]
+    fn the_acceptance_bar_follows_the_measured_connection() {
+        let c = parse(MINIMAL).unwrap();
+        let uncalibrated = c.autotune.acceptance_mbps(None);
+        let calibrated = c.autotune.acceptance_mbps(Some(1000.0));
+        assert_eq!(uncalibrated, DEFAULT_TARGET_MBPS * 0.6);
+        assert_eq!(calibrated, 1000.0 * MEASURED_TARGET_FRACTION * 0.6);
+        assert!(calibrated > uncalibrated);
+    }
+
+    /// On a slow line a fraction of the target would accept nearly anything,
+    /// so the absolute floor has to win there.
+    #[test]
+    fn the_absolute_floor_wins_on_a_slow_connection() {
+        let c = parse(MINIMAL).unwrap();
+        // 20 Mbit/s line: 0.9 * 20 * 0.6 = 10.8, below the 50 floor.
+        assert_eq!(c.autotune.acceptance_mbps(Some(20.0)), c.autotune.min_mbps);
+    }
+
+    #[test]
+    fn rejects_a_nonsensical_accept_fraction() {
+        let text = format!("{MINIMAL}\n[autotune]\naccept_fraction = 1.5\n");
+        assert!(
+            parse(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("between 0.0 and 1.0")
         );
     }
 

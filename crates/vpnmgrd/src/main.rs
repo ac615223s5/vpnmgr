@@ -179,7 +179,7 @@ async fn handle(request: Request, state: &Arc<Mutex<State>>) -> Response {
 
         Request::Status => Response::Status(Box::new(state.status())),
 
-        Request::Connect { server } => match state.connect(server).await {
+        Request::Connect { server, measure } => match state.connect(server, measure).await {
             Ok(chosen) => Response::ok(format!(
                 "connected to {} ({}, {}) via entry {} at {:.1}ms{}",
                 chosen.name,

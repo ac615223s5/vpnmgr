@@ -28,6 +28,15 @@ enum Command {
     Connect {
         /// Server name, e.g. Kornephoros.
         server: Option<String>,
+        /// Measure this connection and the candidates before settling.
+        ///
+        /// Slower, and the only way the acceptance bar reflects your actual
+        /// line rate rather than a default.
+        #[arg(long, conflicts_with = "quick")]
+        measure: bool,
+        /// Connect straight away, trusting the ranking without measuring.
+        #[arg(long, conflicts_with = "measure")]
+        quick: bool,
     },
     /// Tear the tunnel down.
     Disconnect,
@@ -101,8 +110,18 @@ async fn main() -> ExitCode {
 
     let request = match &args.command {
         Command::Status => Request::Status,
-        Command::Connect { server } => Request::Connect {
+        Command::Connect {
+            server,
+            measure,
+            quick,
+        } => Request::Connect {
             server: server.clone(),
+            // Neither flag leaves the choice to autotune.measure_before_connect.
+            measure: match (measure, quick) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
         },
         Command::Disconnect => Request::Disconnect,
         Command::Switch { server } => Request::Switch {

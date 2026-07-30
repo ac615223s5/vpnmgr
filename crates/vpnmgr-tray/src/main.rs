@@ -41,7 +41,11 @@ struct Args {
 /// A request raised by clicking a menu item.
 #[derive(Debug, Clone)]
 enum Action {
-    Connect(Option<String>),
+    /// `measure` of `None` follows the daemon's configured default.
+    Connect {
+        server: Option<String>,
+        measure: Option<bool>,
+    },
     Disconnect,
     Autotune,
     Approve,
@@ -319,12 +323,35 @@ impl Tray for VpnTray {
                 .into(),
             );
         } else {
+            // Two explicit choices rather than one and a hidden default: the
+            // measured path is markedly slower, and which one you want depends
+            // on whether you are about to rely on the connection.
             items.push(
                 StandardItem {
                     label: "Connect to best server".into(),
                     icon_name: "network-vpn".into(),
                     enabled: reachable && idle,
-                    activate: Box::new(|this: &mut Self| this.dispatch(Action::Connect(None))),
+                    activate: Box::new(|this: &mut Self| {
+                        this.dispatch(Action::Connect {
+                            server: None,
+                            measure: Some(false),
+                        })
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(
+                StandardItem {
+                    label: "Connect, measuring speed first".into(),
+                    icon_name: "speedometer".into(),
+                    enabled: reachable && idle,
+                    activate: Box::new(|this: &mut Self| {
+                        this.dispatch(Action::Connect {
+                            server: None,
+                            measure: Some(true),
+                        })
+                    }),
                     ..Default::default()
                 }
                 .into(),
@@ -345,7 +372,10 @@ impl Tray for VpnTray {
                         label,
                         enabled: idle,
                         activate: Box::new(move |this: &mut Self| {
-                            this.dispatch(Action::Connect(Some(name.clone())))
+                            this.dispatch(Action::Connect {
+                                server: Some(name.clone()),
+                                measure: None,
+                            })
                         }),
                         ..Default::default()
                     }
@@ -552,16 +582,27 @@ async fn run_actions(
             .unwrap_or(false);
 
         let (request, busy) = match &action {
-            Action::Connect(None) => (Request::Connect { server: None }, "Finding the best server"),
-            Action::Connect(Some(server)) if connected => (
+            Action::Connect { server: None, measure } => (
+                Request::Connect {
+                    server: None,
+                    measure: *measure,
+                },
+                if measure.unwrap_or(false) {
+                    "Measuring, then choosing a server"
+                } else {
+                    "Finding the best server"
+                },
+            ),
+            Action::Connect { server: Some(server), .. } if connected => (
                 Request::Switch {
                     server: server.clone(),
                 },
                 "Switching",
             ),
-            Action::Connect(Some(server)) => (
+            Action::Connect { server: Some(server), measure } => (
                 Request::Connect {
                     server: Some(server.clone()),
+                    measure: *measure,
                 },
                 "Connecting",
             ),

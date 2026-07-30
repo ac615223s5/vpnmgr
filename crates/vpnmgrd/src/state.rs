@@ -293,7 +293,11 @@ impl State {
         Ok(ranking)
     }
 
-    pub async fn connect(&mut self, server: Option<String>) -> Result<RankedServer> {
+    pub async fn connect(
+        &mut self,
+        server: Option<String>,
+        measure: Option<bool>,
+    ) -> Result<RankedServer> {
         if let Some(current) = &self.current {
             return Err(Error::AlreadyConnected(current.server.clone()));
         }
@@ -301,7 +305,7 @@ impl State {
         // A named server is the user's decision, so it is taken at face value.
         // Only automatic selection second-guesses itself by measuring.
         let Some(name) = server else {
-            return self.connect_best().await;
+            return self.connect_best(measure).await;
         };
 
         let chosen = self.probe_named(&name).await?;
@@ -366,10 +370,39 @@ impl State {
     /// Stops at the first success, so the common case costs one measurement.
     /// If none clear the bar it settles on whichever measured fastest, which is
     /// still a better-informed choice than the top of the ranking.
-    async fn connect_best(&mut self) -> Result<RankedServer> {
+    async fn connect_best(&mut self, measure_first: Option<bool>) -> Result<RankedServer> {
+        let should_measure =
+            measure_first.unwrap_or(self.config.autotune.measure_before_connect);
+
+        // Measured first, while the tunnel is still down — which is precisely
+        // what makes it a *direct* reading, and why it needs no consent the way
+        // `baseline` does. It calibrates the bar the candidates are judged
+        // against, so without it that bar is a guess about this machine.
+        if should_measure {
+            match self.measure_direct().await {
+                Ok(mbps) => {
+                    self.direct_mbps = Some(mbps);
+                    tracing::info!(
+                        mbps = format!("{mbps:.1}"),
+                        "measured this connection directly"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    "could not measure the connection before connecting ({e}); \
+                     falling back to the configured target"
+                ),
+            }
+        }
+
         let ranked = self.sweep(None).await?;
-        let target = self.config.autotune.min_mbps;
-        let attempts = self.config.autotune.verify_candidates.min(ranked.len());
+        let target = self.config.autotune.acceptance_mbps(self.direct_mbps);
+        let attempts = if should_measure {
+            self.config.autotune.verify_candidates.min(ranked.len())
+        } else {
+            // Not measuring the line and then measuring the candidates against
+            // a guessed bar is the worst of both: slow and uncalibrated.
+            0
+        };
 
         let mut candidates = ranked.into_iter();
         let Some(first) = candidates.next() else {
@@ -429,7 +462,7 @@ impl State {
             tracing::info!(
                 server = %candidate.name,
                 mbps = format!("{:.1}", sample.mbps),
-                target = format!("{target:.0}"),
+                needs = format!("{target:.0}"),
                 candidate = index + 1,
                 of = shortlist.len(),
                 "measured a candidate"
@@ -696,6 +729,22 @@ impl State {
         }
     }
 
+    /// Measure the connection itself, with no tunnel involved.
+    ///
+    /// Uses the short selection payload rather than the full one: this runs on
+    /// every connect, and a rough figure is all the acceptance bar needs.
+    async fn measure_direct(&self) -> Result<f64> {
+        let settings = vpnmgr_probe::throughput::Settings {
+            url: self
+                .config
+                .throughput
+                .request_url_for(self.config.throughput.select_bytes),
+            bytes: self.config.throughput.select_bytes,
+            timeout: Duration::from_secs(self.config.throughput.timeout_secs),
+        };
+        Ok(measure(&settings).await?.mbps)
+    }
+
     /// Measure throughput on whatever path is currently in use.
     pub async fn speedtest(&mut self) -> Result<SpeedReport> {
         let settings = self.throughput_settings();
@@ -756,7 +805,9 @@ impl State {
         let direct = measure(&settings).await;
 
         tracing::info!(server = %current.server, "restoring the tunnel");
-        let restored = self.connect(Some(current.server.clone())).await;
+        let restored = self
+            .connect(Some(current.server.clone()), Some(false))
+            .await;
         if let Err(e) = &restored {
             tracing::error!(
                 server = %current.server,
