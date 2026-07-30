@@ -28,10 +28,14 @@ use std::time::SystemTime;
 use vpnmgr_core::ClientConfig;
 
 #[cfg(target_os = "linux")]
+pub mod bypass;
+#[cfg(target_os = "linux")]
 pub mod killswitch;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(target_os = "linux")]
+pub use bypass::Bypass;
 #[cfg(target_os = "linux")]
 pub use killswitch::Killswitch;
 #[cfg(target_os = "linux")]

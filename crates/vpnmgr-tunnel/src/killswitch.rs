@@ -57,6 +57,12 @@ pub struct Killswitch {
     interface: String,
     fwmark: u32,
     allow_lan: bool,
+    /// Destinations deliberately routed around the tunnel.
+    ///
+    /// Without these the two features would contradict each other: the bypass
+    /// sends traffic out the physical interface, which is exactly what the
+    /// kill switch exists to drop.
+    bypass: Vec<String>,
 }
 
 impl Killswitch {
@@ -65,7 +71,14 @@ impl Killswitch {
             interface: interface.into(),
             fwmark,
             allow_lan,
+            bypass: Vec::new(),
         }
+    }
+
+    /// Permit traffic to destinations that bypass the tunnel by design.
+    pub fn allowing(mut self, destinations: Vec<String>) -> Self {
+        self.bypass = destinations;
+        self
     }
 
     /// The nftables script this configuration produces.
@@ -96,6 +109,20 @@ impl Killswitch {
         if self.allow_lan {
             script.push_str(&format!("    ip daddr {{ {LAN_V4} }} accept\n"));
             script.push_str(&format!("    ip6 daddr {{ {LAN_V6} }} accept\n"));
+        }
+        let (v4, v6): (Vec<&String>, Vec<&String>) =
+            self.bypass.iter().partition(|d| !d.contains(':'));
+        if !v4.is_empty() {
+            script.push_str(&format!(
+                "    ip daddr {{ {} }} accept\n",
+                v4.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !v6.is_empty() {
+            script.push_str(&format!(
+                "    ip6 daddr {{ {} }} accept\n",
+                v6.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ));
         }
         script.push_str("    counter drop\n");
         script.push_str("  }\n}\n");
@@ -238,6 +265,22 @@ mod tests {
         assert!(
             script.find("delete table").unwrap() < script.rfind("chain output").unwrap(),
             "the delete has to come before the new definition"
+        );
+    }
+
+    /// The bypass and the kill switch would otherwise contradict each other:
+    /// one routes traffic out the physical interface, the other drops exactly
+    /// that.
+    #[test]
+    fn bypassed_destinations_are_permitted() {
+        let script = Killswitch::new("vpnmgr0", 51820, false)
+            .allowing(vec!["1.2.3.4".into(), "2001:db8::1".into()])
+            .script();
+        assert!(script.contains("ip daddr { 1.2.3.4 } accept"));
+        assert!(script.contains("ip6 daddr { 2001:db8::1 } accept"));
+        assert!(
+            script.find("1.2.3.4").unwrap() < script.find("counter drop").unwrap(),
+            "the exemption must precede the drop"
         );
     }
 

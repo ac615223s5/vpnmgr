@@ -31,6 +31,36 @@ pub struct Config {
     pub killswitch: Killswitch,
     #[serde(default)]
     pub throughput: Throughput,
+    #[serde(default)]
+    pub bypass: Bypass,
+}
+
+/// Destinations that should not travel through the tunnel.
+///
+/// A full tunnel captures everything, including the connection you are working
+/// over and any other VPN you depend on. Loopback and the local network are
+/// already exempt by virtue of how policy routing works; these are the cases
+/// that are not.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bypass {
+    /// Networks or addresses to route around the tunnel.
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+    /// Hostnames to route around the tunnel.
+    ///
+    /// Resolved once, when connecting. A host behind a CDN answers with a
+    /// rotating subset of a larger pool, so prefer a CIDR when the addresses
+    /// move.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Keep other VPNs on this machine working.
+    ///
+    /// On by default because it is otherwise a silent breakage: tools like
+    /// Tailscale keep their routes in a private table consulted *after* ours,
+    /// so connecting quietly makes their peers unreachable.
+    #[serde(default = "default_true")]
+    pub other_vpns: bool,
 }
 
 /// Settings for the Tier-2 throughput test.
@@ -273,6 +303,9 @@ fn default_headroom_margin() -> f64 {
 fn default_verify_candidates() -> usize {
     5
 }
+fn default_true() -> bool {
+    true
+}
 fn default_switch_policy() -> SwitchPolicy {
     SwitchPolicy::Ask
 }
@@ -347,6 +380,16 @@ impl Default for Weights {
             rtt: default_w_rtt(),
             load: default_w_load(),
             headroom: default_w_headroom(),
+        }
+    }
+}
+
+impl Default for Bypass {
+    fn default() -> Self {
+        Self {
+            cidrs: Vec::new(),
+            hosts: Vec::new(),
+            other_vpns: true,
         }
     }
 }
@@ -586,6 +629,7 @@ impl Config {
             probe: Probe::default(),
             killswitch: Killswitch::default(),
             throughput: Throughput::default(),
+            bypass: Bypass::default(),
         }
     }
 }

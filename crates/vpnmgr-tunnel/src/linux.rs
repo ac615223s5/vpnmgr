@@ -23,6 +23,10 @@ pub struct LinuxTunnel {
     /// `up` and released by `down`, so the protected window is exactly the
     /// window in which traffic is supposed to be tunnelled.
     killswitch: Option<crate::Killswitch>,
+    /// Destinations kept out of the tunnel, installed alongside it.
+    bypass: crate::Bypass,
+    /// What to route around the tunnel, decided by the caller.
+    bypass_plan: Vec<crate::bypass::Route>,
 }
 
 impl LinuxTunnel {
@@ -34,12 +38,20 @@ impl LinuxTunnel {
             interface,
             created: false,
             killswitch: None,
+            bypass: crate::Bypass::new(),
+            bypass_plan: Vec::new(),
         })
     }
 
     /// Enforce the kill switch for the lifetime of this tunnel.
     pub fn with_killswitch(mut self, killswitch: crate::Killswitch) -> Self {
         self.killswitch = Some(killswitch);
+        self
+    }
+
+    /// Route these destinations around the tunnel while it is up.
+    pub fn with_bypass(mut self, plan: Vec<crate::bypass::Route>) -> Self {
+        self.bypass_plan = plan;
         self
     }
 
@@ -186,18 +198,34 @@ impl TunnelBackend for LinuxTunnel {
     fn up(&mut self, spec: &TunnelSpec<'_>) -> Result<()> {
         spec.validate()?;
 
-        // Engaged before anything else, so there is no instant between "we
-        // decided to tunnel" and "traffic is confined". `oifname` is matched by
-        // name at runtime, so naming an interface that does not exist yet is
-        // fine.
+        // Bypass routes go in first, so the kill switch can be told about them
+        // in the same breath. The reverse order would leave a window where the
+        // firewall dropped traffic the routing had just exempted.
+        let plan = std::mem::take(&mut self.bypass_plan);
+        self.bypass.install(plan);
+
+        // Engaged before the interface exists, so there is no instant between
+        // "we decided to tunnel" and "traffic is confined". `oifname` is
+        // matched by name at runtime, so naming an interface that does not
+        // exist yet is fine.
         if let Some(killswitch) = &self.killswitch {
-            killswitch.engage()?;
-            tracing::info!(interface = %self.interface, "kill switch engaged");
+            killswitch
+                .clone()
+                .allowing(self.bypass.destinations())
+                .engage()?;
+            tracing::info!(
+                interface = %self.interface,
+                bypassed = self.bypass.destinations().len(),
+                "kill switch engaged"
+            );
         }
 
         // From here on a failure must not strand the machine behind rules for a
         // tunnel that never came up.
         let result = self.bring_up(spec);
+        if result.is_err() {
+            self.bypass.remove();
+        }
         if result.is_err()
             && let Some(_killswitch) = &self.killswitch
         {
@@ -223,6 +251,9 @@ impl TunnelBackend for LinuxTunnel {
             .remove_interface()
             .map_err(|e| wg_err("removing the interface", &self.interface, e));
         self.created = false;
+
+        // Bypass routes only make sense while the tunnel exists.
+        self.bypass.remove();
 
         // Released even if teardown failed: the interface state is unknown, and
         // leaving the machine with no route out is worse than a brief exposure
@@ -276,6 +307,10 @@ impl LinuxTunnel {
         self.api
             .configure_peer_routing(&[peer])
             .map_err(|e| wg_err("installing routes", &self.interface, e))?;
+        // Also pruned here, not only after a switch: a previous run that did
+        // not shut down cleanly leaves its rules behind, and each connect would
+        // otherwise add another pair on top of them.
+        self.prune_duplicate_policy_rules(spec.fwmark);
 
         if !spec.client.dns.is_empty() || !spec.client.search_domains.is_empty() {
             let domains: Vec<&str> = spec

@@ -655,18 +655,37 @@ impl State {
         Ok(out)
     }
 
-    /// A tunnel handle carrying the configured kill switch, if any.
+    /// A tunnel handle carrying the configured kill switch and bypass, if any.
+    ///
+    /// The bypass is planned here rather than once at startup because it
+    /// depends on what the machine looks like *now*: which VPNs are running,
+    /// what the default gateway is, and what the configured hostnames currently
+    /// resolve to.
     fn new_tunnel(&self) -> Result<LinuxTunnel> {
-        let tunnel = LinuxTunnel::new(vpnmgr_tunnel::DEFAULT_INTERFACE)?;
+        let mut tunnel = LinuxTunnel::new(vpnmgr_tunnel::DEFAULT_INTERFACE)?;
+
+        let plan = vpnmgr_tunnel::Bypass::plan(
+            &self.config.bypass.cidrs,
+            &self.config.bypass.hosts,
+            self.config.bypass.other_vpns,
+            vpnmgr_tunnel::DEFAULT_INTERFACE,
+        );
+        if !plan.is_empty() {
+            tracing::info!(
+                destinations = plan.len(),
+                "routing some destinations around the tunnel"
+            );
+            tunnel = tunnel.with_bypass(plan);
+        }
+
         if self.config.killswitch.enabled {
-            Ok(tunnel.with_killswitch(Killswitch::new(
+            tunnel = tunnel.with_killswitch(Killswitch::new(
                 vpnmgr_tunnel::DEFAULT_INTERFACE,
                 DEFAULT_FWMARK,
                 self.config.killswitch.allow_lan,
-            )))
-        } else {
-            Ok(tunnel)
+            ));
         }
+        Ok(tunnel)
     }
 
     fn throughput_settings(&self) -> vpnmgr_probe::throughput::Settings {
