@@ -17,7 +17,10 @@ pub enum Rejection {
     ServerNotWhitelisted,
     ServerBlacklisted,
     /// Reported load exceeded `filters.max_load`.
-    LoadTooHigh { load: u32, max: u32 },
+    LoadTooHigh {
+        load: u32,
+        max: u32,
+    },
 }
 
 impl std::fmt::Display for Rejection {
@@ -65,41 +68,82 @@ impl<'a> Selection<'a> {
     }
 }
 
+/// [`Filters`] compiled into the form the checks actually need: case-folded,
+/// whitespace-trimmed sets.
+///
+/// Kept separate from `apply` so that anything holding servers in some other
+/// shape — a stored ranking, say, which has names and country codes but not the
+/// full API record — can be judged by exactly the same rules. Two independent
+/// implementations of "is this server eligible" would drift, and the way that
+/// drift shows up is a filtered-out server still being offered somewhere.
+pub struct Ruleset {
+    country_white: std::collections::HashSet<String>,
+    country_black: std::collections::HashSet<String>,
+    server_white: std::collections::HashSet<String>,
+    server_black: std::collections::HashSet<String>,
+    max_load: u32,
+}
+
+impl Ruleset {
+    pub fn new(filters: &Filters) -> Self {
+        Self {
+            country_white: normalised(&filters.country_whitelist),
+            country_black: normalised(&filters.country_blacklist),
+            server_white: normalised(&filters.server_whitelist),
+            server_black: normalised(&filters.server_blacklist),
+            max_load: filters.max_load,
+        }
+    }
+
+    /// Why this server is excluded, or `None` if it passes.
+    ///
+    /// Order matters for the reported reason: blacklists first (an explicit
+    /// exclusion is the most useful thing to report), then whitelists, then
+    /// load. Health is checked by the caller, which is the only one that knows
+    /// it.
+    pub fn judge(&self, name: &str, country_code: &str, load: u32) -> Option<Rejection> {
+        let name = name.trim().to_ascii_lowercase();
+        let country = country_code.trim().to_ascii_lowercase();
+
+        if self.server_black.contains(&name) {
+            Some(Rejection::ServerBlacklisted)
+        } else if self.country_black.contains(&country) {
+            Some(Rejection::CountryBlacklisted)
+        } else if !self.server_white.is_empty() && !self.server_white.contains(&name) {
+            Some(Rejection::ServerNotWhitelisted)
+        } else if !self.country_white.is_empty() && !self.country_white.contains(&country) {
+            Some(Rejection::CountryNotWhitelisted)
+        } else if load > self.max_load {
+            Some(Rejection::LoadTooHigh {
+                load,
+                max: self.max_load,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Whether this server passes the metadata filters.
+    pub fn accepts(&self, name: &str, country_code: &str, load: u32) -> bool {
+        self.judge(name, country_code, load).is_none()
+    }
+}
+
 /// Apply `filters` to `list`.
 ///
-/// Order matters for the reported reason: health first, then blacklists (an
-/// explicit exclusion is the most useful thing to report), then whitelists,
-/// then load.
+/// Health comes first: an unhealthy server is worth reporting as such even if
+/// it would also have been blacklisted.
 pub fn apply<'a>(list: &'a ServerList, filters: &Filters) -> Selection<'a> {
-    let country_white = normalised(&filters.country_whitelist);
-    let country_black = normalised(&filters.country_blacklist);
-    let server_white = normalised(&filters.server_whitelist);
-    let server_black = normalised(&filters.server_blacklist);
+    let rules = Ruleset::new(filters);
 
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
 
     for server in &list.servers {
-        let name = server.name.to_ascii_lowercase();
-        let country = server.country_code.to_ascii_lowercase();
-
         let reason = if !server.is_healthy() {
             Some(Rejection::Unhealthy(server.warning.clone()))
-        } else if server_black.contains(&name) {
-            Some(Rejection::ServerBlacklisted)
-        } else if country_black.contains(&country) {
-            Some(Rejection::CountryBlacklisted)
-        } else if !server_white.is_empty() && !server_white.contains(&name) {
-            Some(Rejection::ServerNotWhitelisted)
-        } else if !country_white.is_empty() && !country_white.contains(&country) {
-            Some(Rejection::CountryNotWhitelisted)
-        } else if server.load > filters.max_load {
-            Some(Rejection::LoadTooHigh {
-                load: server.load,
-                max: filters.max_load,
-            })
         } else {
-            None
+            rules.judge(&server.name, &server.country_code, server.load)
         };
 
         match reason {
@@ -254,5 +298,56 @@ mod tests {
         let list = list();
         let sel = apply(&list, &filters());
         assert_eq!(sel.accepted.len() + sel.rejected.len(), list.servers.len());
+    }
+
+    /// The ruleset is what callers holding a stored ranking use, so it has to
+    /// reach the same verdict as a full pass over the API records. If these two
+    /// ever disagree, a filtered-out server stays on offer in the picker.
+    #[test]
+    fn the_ruleset_agrees_with_apply_on_every_healthy_server() {
+        let list = list();
+        let f = Filters {
+            country_whitelist: vec!["ca".into()],
+            server_blacklist: vec!["Alcyone".into()],
+            max_load: 85,
+            ..filters()
+        };
+        let rules = Ruleset::new(&f);
+        let sel = apply(&list, &f);
+
+        for server in &sel.accepted {
+            assert!(
+                rules.accepts(&server.name, &server.country_code, server.load),
+                "{} was accepted by apply but rejected by the ruleset",
+                server.name
+            );
+        }
+        for (server, reason) in &sel.rejected {
+            if matches!(reason, Rejection::Unhealthy(_)) {
+                continue; // health is the caller's check, not the ruleset's
+            }
+            assert!(
+                !rules.accepts(&server.name, &server.country_code, server.load),
+                "{} was rejected by apply but accepted by the ruleset",
+                server.name
+            );
+        }
+        assert!(
+            !sel.accepted.is_empty(),
+            "fixture should have Canadian servers"
+        );
+    }
+
+    #[test]
+    fn the_ruleset_excludes_other_countries_under_a_whitelist() {
+        let rules = Ruleset::new(&Filters {
+            country_whitelist: vec!["ca".into()],
+            ..filters()
+        });
+        assert!(rules.accepts("Alcyone", "CA", 20));
+        assert_eq!(
+            rules.judge("Benetnasch", "se", 20),
+            Some(Rejection::CountryNotWhitelisted)
+        );
     }
 }

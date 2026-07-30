@@ -215,7 +215,11 @@ async fn handle(request: Request, state: &Arc<Mutex<State>>) -> Response {
 
         Request::LastRanking { limit } => Response::Ranking(state.last_ranking(limit)),
 
-        Request::Servers { country, limit } => match state.servers(country, limit).await {
+        Request::Servers {
+            country,
+            limit,
+            all,
+        } => match state.servers(country, limit, all).await {
             Ok(servers) => Response::Servers(servers),
             Err(e) => Response::error(e),
         },

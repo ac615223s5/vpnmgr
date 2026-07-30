@@ -31,7 +31,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(10);
 const QUICK_CONNECT_LIMIT: usize = 12;
 
 #[derive(Parser)]
-#[command(name = "vpnmgr-tray", about = "System tray for the WireGuard VPN manager", version)]
+#[command(
+    name = "vpnmgr-tray",
+    about = "System tray for the WireGuard VPN manager",
+    version
+)]
 struct Args {
     /// Daemon socket.
     #[arg(long, default_value = DEFAULT_SOCKET)]
@@ -97,9 +101,9 @@ impl VpnTray {
     /// A pending proposal, or a connected-but-unhealthy tunnel, both want the
     /// user's eye.
     fn needs_attention(&self) -> bool {
-        self.status.as_ref().is_some_and(|s| {
-            s.pending_switch.is_some() || (s.connected && !s.healthy)
-        })
+        self.status
+            .as_ref()
+            .is_some_and(|s| s.pending_switch.is_some() || (s.connected && !s.healthy))
     }
 
     /// Queue an action. Failure means the worker is gone, i.e. we are exiting.
@@ -582,7 +586,10 @@ async fn run_actions(
             .unwrap_or(false);
 
         let (request, busy) = match &action {
-            Action::Connect { server: None, measure } => (
+            Action::Connect {
+                server: None,
+                measure,
+            } => (
                 Request::Connect {
                     server: None,
                     measure: *measure,
@@ -593,13 +600,19 @@ async fn run_actions(
                     "Finding the best server"
                 },
             ),
-            Action::Connect { server: Some(server), .. } if connected => (
+            Action::Connect {
+                server: Some(server),
+                ..
+            } if connected => (
                 Request::Switch {
                     server: server.clone(),
                 },
                 "Switching",
             ),
-            Action::Connect { server: Some(server), measure } => (
+            Action::Connect {
+                server: Some(server),
+                measure,
+            } => (
                 Request::Connect {
                     server: Some(server.clone()),
                     measure: *measure,
@@ -681,6 +694,9 @@ async fn refresh(handle: &ksni::Handle<VpnTray>, socket: &PathBuf) {
                 &Request::Servers {
                     country: None,
                     limit: Some(QUICK_CONNECT_LIMIT),
+                    // Never `all`: the picker connects to what it shows, so it
+                    // must only show what the config allows.
+                    all: false,
                 },
             )
             .await
@@ -752,7 +768,10 @@ mod tests {
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("vpnmgr-tray-test-{name}-{}.lock", std::process::id()));
+        p.push(format!(
+            "vpnmgr-tray-test-{name}-{}.lock",
+            std::process::id()
+        ));
         p
     }
 

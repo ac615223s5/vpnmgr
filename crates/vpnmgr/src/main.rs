@@ -41,9 +41,7 @@ enum Command {
     /// Tear the tunnel down.
     Disconnect,
     /// Move an existing connection to another server.
-    Switch {
-        server: String,
-    },
+    Switch { server: String },
     /// Probe servers and show the ranking without connecting.
     Test {
         /// Restrict to one country code, e.g. ca.
@@ -53,12 +51,15 @@ enum Command {
         #[arg(long, default_value_t = 15)]
         limit: usize,
     },
-    /// List known servers and their load. Does not probe.
+    /// List servers allowed by the filters, and their load. Does not probe.
     Servers {
         #[arg(long)]
         country: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+        /// List the whole fleet, including servers the filters exclude.
+        #[arg(long)]
+        all: bool,
     },
     /// Show the ranking from the last sweep without probing again.
     Ranking {
@@ -130,9 +131,14 @@ async fn main() -> ExitCode {
         Command::Test { country, .. } => Request::Test {
             country: country.clone(),
         },
-        Command::Servers { country, limit } => Request::Servers {
+        Command::Servers {
+            country,
+            limit,
+            all,
+        } => Request::Servers {
             country: country.clone(),
             limit: *limit,
+            all: *all,
         },
         Command::Ranking { limit } => Request::LastRanking {
             limit: Some(*limit),
@@ -233,7 +239,9 @@ async fn main() -> ExitCode {
                     "\n  {} ({}) at {:.1}ms, load {}%",
                     pending.to.name, pending.to.location, pending.to.rtt_ms, pending.to.load
                 );
-                println!("  run `vpnmgr approve` to switch, or `vpnmgr dismiss` to keep the current server");
+                println!(
+                    "  run `vpnmgr approve` to switch, or `vpnmgr dismiss` to keep the current server"
+                );
             }
             ExitCode::SUCCESS
         }
@@ -252,10 +260,7 @@ fn print_speed(report: &SpeedReport) {
     };
 
     if let Some(s) = &report.tunnelled {
-        line(
-            report.server.as_deref().unwrap_or("via VPN"),
-            s,
-        );
+        line(report.server.as_deref().unwrap_or("via VPN"), s);
     }
     if let Some(s) = &report.direct {
         line("direct", s);

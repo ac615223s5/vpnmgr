@@ -166,7 +166,43 @@ impl State {
         self.client = client;
         // Force a refetch so new filters are applied to fresh data.
         self.servers = None;
+        self.apply_filters_to_cached_results();
         Ok(())
+    }
+
+    /// Drop anything the newly-loaded filters no longer allow.
+    ///
+    /// The stored ranking and the pending proposal both outlive a reload, and
+    /// both are offered to the user as things to connect to. Left alone they
+    /// would keep offering servers the config has just excluded — for up to a
+    /// full tuning interval, which reads as the filter being ignored.
+    ///
+    /// Measurements for surviving servers are kept: an RTT does not stop being
+    /// true because the country list changed, and re-probing on every reload
+    /// would make editing the config needlessly expensive.
+    fn apply_filters_to_cached_results(&mut self) {
+        let rules = filter::Ruleset::new(&self.config.filters);
+
+        let before = self.last_ranking.len();
+        self.last_ranking
+            .retain(|s| rules.accepts(&s.name, &s.country_code, s.load));
+        let dropped = before - self.last_ranking.len();
+        if dropped > 0 {
+            tracing::info!(
+                "filters now exclude {dropped} of the {before} ranked servers; \
+                 run `vpnmgr test` to rank the rest"
+            );
+        }
+
+        if let Some((pending, _, _)) = &self.pending
+            && !rules.accepts(&pending.name, &pending.country_code, pending.load)
+        {
+            tracing::info!(
+                server = %pending.name,
+                "dropping the pending proposal: the new filters exclude it"
+            );
+            self.pending = None;
+        }
     }
 
     /// The AirVPN server list, refetched when the cache has expired.
@@ -206,9 +242,7 @@ impl State {
     fn scoring(&self) -> score::Scoring {
         score::Scoring::new(
             self.config.autotune.weights,
-            self.config
-                .autotune
-                .headroom_target_mbps(self.direct_mbps),
+            self.config.autotune.headroom_target_mbps(self.direct_mbps),
         )
     }
 
@@ -221,7 +255,9 @@ impl State {
     fn prober(&self) -> Prober {
         let mut prober = Prober::new(&self.client, self.config.probe.clone());
         if let Some(current) = &self.current {
-            prober = prober.with_fwmark(DEFAULT_FWMARK).excluding(current.endpoint);
+            prober = prober
+                .with_fwmark(DEFAULT_FWMARK)
+                .excluding(current.endpoint);
         }
         prober
     }
@@ -285,10 +321,7 @@ impl State {
         }
 
         let _ = probe_settings;
-        let ranking: Vec<RankedServer> = ranked
-            .iter()
-            .map(|s| self.to_ranked(s))
-            .collect();
+        let ranking: Vec<RankedServer> = ranked.iter().map(|s| self.to_ranked(s)).collect();
         self.last_ranking = ranking.clone();
         Ok(ranking)
     }
@@ -371,8 +404,7 @@ impl State {
     /// If none clear the bar it settles on whichever measured fastest, which is
     /// still a better-informed choice than the top of the ranking.
     async fn connect_best(&mut self, measure_first: Option<bool>) -> Result<RankedServer> {
-        let should_measure =
-            measure_first.unwrap_or(self.config.autotune.measure_before_connect);
+        let should_measure = measure_first.unwrap_or(self.config.autotune.measure_before_connect);
 
         // Measured first, while the tunnel is still down — which is precisely
         // what makes it a *direct* reading, and why it needs no consent the way
@@ -509,7 +541,10 @@ impl State {
             // Every candidate failed to come up or measure; the tunnel is
             // pointed at the last one tried, which is the best we can say.
             None => {
-                let fallback = shortlist.into_iter().next().expect("shortlist is non-empty");
+                let fallback = shortlist
+                    .into_iter()
+                    .next()
+                    .expect("shortlist is non-empty");
                 if self.current.is_none() {
                     self.establish(&fallback)?;
                 }
@@ -656,20 +691,40 @@ impl State {
         }
     }
 
+    /// Known servers, narrowed by the configured filters unless `all` is set.
+    ///
+    /// Filtered by default because the answer feeds the tray's quick-connect
+    /// list, and offering a server the config excludes is a bug there. `all`
+    /// exists for the browsing case — deciding what to put in a whitelist means
+    /// seeing what you have not whitelisted yet.
+    ///
+    /// An explicit `country` replaces the country whitelist rather than
+    /// intersecting with it, matching how `sweep` treats the same argument; the
+    /// blacklists, `max_load` and the health check still apply.
     pub async fn servers(
         &mut self,
         country: Option<String>,
         limit: Option<usize>,
+        all: bool,
     ) -> Result<Vec<ServerSummary>> {
-        let list = self.server_list().await?;
+        let mut filters = self.config.filters.clone();
         let wanted = country.map(|c| c.trim().to_ascii_lowercase());
+        if let Some(country) = wanted.clone() {
+            filters.country_whitelist = vec![country];
+        }
+        let rules = filter::Ruleset::new(&filters);
+
+        let list = self.server_list().await?;
         let mut out: Vec<ServerSummary> = list
             .servers
             .iter()
             .filter(|s| {
-                wanted
-                    .as_ref()
-                    .is_none_or(|c| s.country_code.eq_ignore_ascii_case(c))
+                if all {
+                    return wanted
+                        .as_ref()
+                        .is_none_or(|c| s.country_code.eq_ignore_ascii_case(c));
+                }
+                s.is_healthy() && rules.accepts(&s.name, &s.country_code, s.load)
             })
             .map(|s| ServerSummary {
                 name: s.name.clone(),
@@ -962,7 +1017,8 @@ impl State {
     async fn probe_current(&mut self, server_name: &str) -> Option<f64> {
         let entries = airvpn::WG_ENTRIES;
         let port = self.config.provider.airvpn.port;
-        let prober = Prober::new(&self.client, self.config.probe.clone()).with_fwmark(DEFAULT_FWMARK);
+        let prober =
+            Prober::new(&self.client, self.config.probe.clone()).with_fwmark(DEFAULT_FWMARK);
 
         let list = self.server_list().await.ok()?;
         let server = list.get(server_name)?;
@@ -1108,12 +1164,8 @@ impl State {
     }
 }
 
-
-
 /// Run one throughput measurement, converting it for the wire.
-async fn measure(
-    settings: &vpnmgr_probe::throughput::Settings,
-) -> Result<SpeedSample> {
+async fn measure(settings: &vpnmgr_probe::throughput::Settings) -> Result<SpeedSample> {
     let t = vpnmgr_probe::throughput::measure(settings).await?;
     Ok(SpeedSample {
         mbps: t.mbps,

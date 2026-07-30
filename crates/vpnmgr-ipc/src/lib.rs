@@ -43,19 +43,31 @@ pub enum Request {
     },
     Disconnect,
     /// Move an existing tunnel to a different server.
-    Switch { server: String },
+    Switch {
+        server: String,
+    },
     /// Run a probe sweep and return the ranking without connecting.
-    Test { country: Option<String> },
+    Test {
+        country: Option<String>,
+    },
     /// The ranking from the most recent sweep, without probing again.
     ///
     /// Distinct from [`Request::Test`], which costs a full fleet sweep. This is
     /// for callers that want latency-ordered servers cheaply and often — a tray
     /// menu redrawn every few seconds cannot afford to probe.
-    LastRanking { limit: Option<usize> },
+    LastRanking {
+        limit: Option<usize>,
+    },
     /// List known servers from the cached API data. Does not probe.
     Servers {
         country: Option<String>,
         limit: Option<usize>,
+        /// Ignore the configured filters and list the whole fleet.
+        ///
+        /// Defaulted so that a client built before this field existed still
+        /// gets the safe, filtered answer.
+        #[serde(default)]
+        all: bool,
     },
     /// Re-read the config file from disk.
     Reload,
@@ -73,10 +85,14 @@ pub enum Request {
     /// `confirm` must be set: this briefly drops the tunnel, which exposes the
     /// real IP address and releases the kill switch. The daemon refuses
     /// otherwise rather than assuming consent.
-    Baseline { confirm: bool },
+    Baseline {
+        confirm: bool,
+    },
     /// Turn the kill switch on or off, or report its state when `enable` is
     /// `None`.
-    Killswitch { enable: Option<bool> },
+    Killswitch {
+        enable: Option<bool>,
+    },
 }
 
 /// Adjacently tagged rather than internally tagged: serde cannot serialise a
@@ -88,9 +104,15 @@ pub enum Response {
     Status(Box<StatusReport>),
     Ranking(Vec<RankedServer>),
     Servers(Vec<ServerSummary>),
-    Ok { message: String },
-    Error { message: String },
-    Version { version: String },
+    Ok {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+    Version {
+        version: String,
+    },
     /// Outcome of a tuning pass.
     Tuned(Box<TuneReport>),
     /// Outcome of a throughput measurement.
@@ -331,7 +353,10 @@ mod tests {
 
     fn roundtrip(request: Request) {
         let line = serde_json::to_string(&request).unwrap();
-        assert!(!line.contains('\n'), "framing requires single-line messages");
+        assert!(
+            !line.contains('\n'),
+            "framing requires single-line messages"
+        );
         assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), request);
     }
 
@@ -360,6 +385,12 @@ mod tests {
         roundtrip(Request::Servers {
             country: None,
             limit: Some(10),
+            all: false,
+        });
+        roundtrip(Request::Servers {
+            country: Some("ca".into()),
+            limit: None,
+            all: true,
         });
         roundtrip(Request::LastRanking { limit: Some(12) });
         roundtrip(Request::LastRanking { limit: None });
@@ -429,7 +460,10 @@ mod tests {
     fn response_roundtrip(response: Response) {
         let line = serde_json::to_string(&response)
             .unwrap_or_else(|e| panic!("{response:?} failed to serialise: {e}"));
-        assert!(!line.contains('\n'), "framing requires single-line messages");
+        assert!(
+            !line.contains('\n'),
+            "framing requires single-line messages"
+        );
         assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), response);
     }
 
