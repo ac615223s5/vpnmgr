@@ -3,3 +3,4 @@
 !crates/*/tests/fixtures/*.conf
 *.key
 *.psk
+/dist

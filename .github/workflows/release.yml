@@ -1,0 +1,156 @@
+name: release
+
+# Tag-driven: pushing v0.1.0 builds it, tests it, and publishes the tarball.
+# workflow_dispatch is here for re-running a release whose upload failed,
+# without having to delete and re-push the tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  # Built on the oldest runner still supported so the glibc the binaries link
+  # against is older than the one on any machine likely to install them.
+  # Building on latest would produce binaries that refuse to start on anything
+  # a year behind.
+  TRIPLE: x86_64-unknown-linux-gnu
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve the tag
+        id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      # A tag that disagrees with Cargo.toml would ship binaries reporting a
+      # different version from the release they are attached to, and the
+      # updater compares exactly those two things to decide whether you are up
+      # to date. Catch it before anything is published.
+      - name: Check the tag matches the crate version
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag="${{ steps.tag.outputs.tag }}"
+          if [[ "v$crate" != "$tag" ]]; then
+            echo "tag $tag does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+          echo "version $crate"
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+
+      # --locked everywhere: a release must build from the committed
+      # Cargo.lock, not from whatever resolved that morning.
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Lint
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          stem="vpnmgr-${{ steps.tag.outputs.tag }}-${TRIPLE}"
+          mkdir -p "dist/$stem/bin" "dist/$stem/packaging"
+          cp target/release/vpnmgrd target/release/vpnmgr target/release/vpnmgr-tray "dist/$stem/bin/"
+          cp packaging/vpnmgrd.service packaging/vpnmgr.desktop packaging/vpnmgr-tray.desktop "dist/$stem/packaging/"
+          # The updater is shipped inside the tarball too, so install.sh can put
+          # it on PATH and the next update needs no checkout and no curl | bash.
+          cp packaging/vpnmgr-update.sh "dist/$stem/packaging/"
+          cp packaging/install.sh "dist/$stem/install.sh"
+          cp LICENSE README.md "dist/$stem/"
+          chmod +x "dist/$stem/install.sh" "dist/$stem/packaging/vpnmgr-update.sh"
+          tar -czf "dist/$stem.tar.gz" -C dist "$stem"
+          ( cd dist && sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256" )
+          echo "stem=$stem" >> "$GITHUB_OUTPUT"
+          echo "sha=$(awk '{print $1}' "dist/$stem.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
+
+      # Prove the packaged tarball is actually installable before publishing it.
+      # A release that unpacks into the wrong layout is the failure mode this
+      # catches, and it is one nobody notices until a user tries to install.
+      - name: Smoke-test the package
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/${{ steps.package.outputs.stem }}.tar.gz" -C "$RUNNER_TEMP"
+          dir="$RUNNER_TEMP/${{ steps.package.outputs.stem }}"
+          test -x "$dir/install.sh"
+          test -x "$dir/bin/vpnmgrd"
+          test -f "$dir/packaging/vpnmgrd.service"
+          "$dir/bin/vpnmgr" --version
+          "$dir/bin/vpnmgrd" --version
+          # Run the installer as a non-root user: it must refuse rather than
+          # half-install, and that refusal is the only part safe to exercise on
+          # a runner.
+          if "$dir/install.sh" 2>/dev/null; then
+            echo "install.sh did not refuse to run without root" >&2
+            exit 1
+          fi
+
+      - name: Write the release notes
+        run: |
+          cat > dist/notes.md <<EOF
+          ## Install
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/master/packaging/vpnmgr-update.sh \\
+            | sudo bash -s -- --conf /path/to/AirVPN.conf
+          \`\`\`
+
+          Get the \`.conf\` from AirVPN's Config Generator: WireGuard, UDP port 1637.
+          Any single server's config will do — the client key is account-wide, so
+          vpnmgr synthesises the rest of the fleet from it.
+
+          ## Update
+
+          \`\`\`bash
+          sudo vpnmgr-update
+          \`\`\`
+
+          Keeps your config and keys. \`--check\` reports without installing.
+
+          ## Verify
+
+          \`\`\`
+          ${{ steps.package.outputs.sha }}  ${{ steps.package.outputs.stem }}.tar.gz
+          \`\`\`
+
+          Linux x86_64, glibc 2.35 or newer. Requires the \`wireguard\` kernel
+          module and systemd.
+          EOF
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          # Idempotent, so a re-run after a failed upload replaces the assets
+          # instead of erroring on an existing release.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber \
+              "dist/${{ steps.package.outputs.stem }}.tar.gz" \
+              "dist/${{ steps.package.outputs.stem }}.tar.gz.sha256"
+          else
+            gh release create "$tag" \
+              --title "vpnmgr $tag" \
+              --notes-file dist/notes.md \
+              "dist/${{ steps.package.outputs.stem }}.tar.gz" \
+              "dist/${{ steps.package.outputs.stem }}.tar.gz.sha256"
+          fi

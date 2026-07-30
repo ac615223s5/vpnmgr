@@ -21,7 +21,7 @@ use vpnmgr_ipc::{DEFAULT_SOCKET, MAX_LINE, Request, Response, SOCKET_GROUP};
 use crate::state::State;
 
 #[derive(Parser)]
-#[command(name = "vpnmgrd", about = "WireGuard VPN manager daemon")]
+#[command(name = "vpnmgrd", about = "WireGuard VPN manager daemon", version)]
 struct Args {
     /// Configuration file.
     #[arg(long, default_value = vpnmgr_core::config::DEFAULT_PATH)]

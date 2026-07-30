@@ -14,7 +14,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/sunshine/vpn"
+repository = "https://github.com/ac615223s5/vpnmgr"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
