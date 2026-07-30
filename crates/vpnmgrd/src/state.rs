@@ -60,6 +60,14 @@ pub struct State {
     /// The server the user was on when they last turned down a proposal, and
     /// when. Kept so the tuner does not re-raise the suggestion every cycle.
     dismissed: Option<(String, Instant)>,
+    /// Throughput measured per server, keyed by name.
+    ///
+    /// Fills in as servers are actually used: a measurement costs tens of
+    /// megabytes, so it only ever exists for servers the user has speed-tested
+    /// while connected. Held in memory rather than persisted -- the daemon is
+    /// long-lived, and a stale figure from before a restart would be worth less
+    /// than the complexity of storing it.
+    throughput_seen: std::collections::HashMap<String, (f64, Instant)>,
     /// Outcome of the most recent tuning pass, for `vpnmgr status`.
     last_tune: Option<String>,
     /// When the last pass ran; the schedule is measured from here so a manual
@@ -123,6 +131,7 @@ impl State {
             last_ranking: Vec::new(),
             pending: None,
             dismissed: None,
+            throughput_seen: std::collections::HashMap::new(),
             last_tune: None,
             last_tune_at: None,
         })
@@ -222,7 +231,7 @@ impl State {
         let reachable = measured.iter().filter(|m| m.rtt.is_some()).count();
         let ranked = score::rank(&measured, &weights);
 
-        let best = ranked.first().map(to_ranked);
+        let best = ranked.first().map(|s| self.to_ranked(s));
         // Distinguishing "nothing reachable" from "nothing good" matters: the
         // former is never a reason to switch servers.
         let all_unreachable = reachable == 0;
@@ -243,7 +252,10 @@ impl State {
         }
 
         let _ = probe_settings;
-        let ranking: Vec<RankedServer> = ranked.iter().map(to_ranked).collect();
+        let ranking: Vec<RankedServer> = ranked
+            .iter()
+            .map(|s| self.to_ranked(s))
+            .collect();
         self.last_ranking = ranking.clone();
         Ok(ranking)
     }
@@ -296,12 +308,27 @@ impl State {
 
         let measured = sweep(&prober, &[server], &entries, port).await;
         let ranked = score::rank(&measured, &weights);
-        ranked
-            .first()
-            .map(to_ranked)
-            .ok_or_else(|| Error::ServerUnreachable {
-                server: name.to_owned(),
-            })
+        let chosen = ranked.first().map(|s| RankedServer {
+            name: s.server.name.clone(),
+            country_code: s.server.country_code.clone(),
+            country_name: s.server.country_name.clone(),
+            location: s.server.location.clone(),
+            load: s.server.load,
+            rtt_ms: s.rtt.as_secs_f64() * 1000.0,
+            score: s.score,
+            entry: s.entry,
+            endpoint: s.endpoint,
+            mbps: None,
+            mbps_age_secs: None,
+        });
+        let mut chosen = chosen.ok_or_else(|| Error::ServerUnreachable {
+            server: name.to_owned(),
+        })?;
+        if let Some((mbps, at)) = self.throughput_seen.get(&chosen.name) {
+            chosen.mbps = Some(*mbps);
+            chosen.mbps_age_secs = Some(at.elapsed().as_secs());
+        }
+        Ok(chosen)
     }
 
     pub async fn switch(&mut self, name: &str) -> Result<RankedServer> {
@@ -467,6 +494,9 @@ impl State {
 
         let sample = measure(&settings).await?;
         let meets_target = sample.mbps >= min_mbps;
+        if let Some(server) = &connected {
+            self.record_throughput(server, sample.mbps);
+        }
 
         let verdict = match &connected {
             Some(server) => format!(
@@ -507,6 +537,7 @@ impl State {
         };
 
         let tunnelled = measure(&settings).await?;
+        self.record_throughput(&current.server, tunnelled.mbps);
 
         tracing::info!("dropping the tunnel for a direct measurement");
         self.disconnect()?;
@@ -585,9 +616,48 @@ impl State {
         })
     }
 
+    /// Attach any recorded throughput to a scored server.
+    fn to_ranked(&self, s: &score::Scored<'_>) -> RankedServer {
+        let measured = self.throughput_seen.get(&s.server.name);
+        RankedServer {
+            name: s.server.name.clone(),
+            country_code: s.server.country_code.clone(),
+            country_name: s.server.country_name.clone(),
+            location: s.server.location.clone(),
+            load: s.server.load,
+            rtt_ms: s.rtt.as_secs_f64() * 1000.0,
+            score: s.score,
+            entry: s.entry,
+            endpoint: s.endpoint,
+            mbps: measured.map(|(mbps, _)| *mbps),
+            mbps_age_secs: measured.map(|(_, at)| at.elapsed().as_secs()),
+        }
+    }
+
+    /// Remember what a server actually delivered.
+    fn record_throughput(&mut self, server: &str, mbps: f64) {
+        self.throughput_seen
+            .insert(server.to_owned(), (mbps, Instant::now()));
+        // The cached ranking is what clients read, so update it in place rather
+        // than making them wait for the next sweep to see the figure.
+        for entry in &mut self.last_ranking {
+            if entry.name == server {
+                entry.mbps = Some(mbps);
+                entry.mbps_age_secs = Some(0);
+            }
+        }
+    }
+
     /// The cached ranking from the last sweep, best first.
     pub fn last_ranking(&self, limit: Option<usize>) -> Vec<RankedServer> {
         let mut out = self.last_ranking.clone();
+        // Ages are relative to now, not to when the sweep ran.
+        for entry in &mut out {
+            if let Some((mbps, at)) = self.throughput_seen.get(&entry.name) {
+                entry.mbps = Some(*mbps);
+                entry.mbps_age_secs = Some(at.elapsed().as_secs());
+            }
+        }
         if let Some(limit) = limit {
             out.truncate(limit);
         }
@@ -773,19 +843,7 @@ impl State {
     }
 }
 
-fn to_ranked(s: &score::Scored<'_>) -> RankedServer {
-    RankedServer {
-        name: s.server.name.clone(),
-        country_code: s.server.country_code.clone(),
-        country_name: s.server.country_name.clone(),
-        location: s.server.location.clone(),
-        load: s.server.load,
-        rtt_ms: s.rtt.as_secs_f64() * 1000.0,
-        score: s.score,
-        entry: s.entry,
-        endpoint: s.endpoint,
-    }
-}
+
 
 /// Run one throughput measurement, converting it for the wire.
 async fn measure(

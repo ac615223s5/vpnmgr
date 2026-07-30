@@ -330,23 +330,65 @@ fn human_duration(secs: u64) -> String {
 }
 
 fn print_ranking(ranking: &[RankedServer], limit: usize) {
-    println!(
-        "{:<16} {:<20} {:>4} {:>8} {:>6} {:>6}  entry",
-        "SERVER", "LOCATION", "CC", "RTT", "LOAD", "SCORE"
-    );
-    for s in ranking.iter().take(limit) {
+    // The speed column is blank for servers that have never been measured,
+    // which is most of them: a throughput test moves tens of megabytes and only
+    // runs against the server you are connected to.
+    let any_measured = ranking.iter().any(|s| s.mbps.is_some());
+    if any_measured {
         println!(
-            "{:<16} {:<20} {:>4} {:>6.1}ms {:>5}% {:>6.3}  {}",
-            s.name,
-            truncate(&s.location, 20),
-            s.country_code,
-            s.rtt_ms,
-            s.load,
-            s.score,
-            s.entry
+            "{:<16} {:<20} {:>4} {:>8} {:>6} {:>6} {:>12}  entry",
+            "SERVER", "LOCATION", "CC", "RTT", "LOAD", "SCORE", "MEASURED"
+        );
+    } else {
+        println!(
+            "{:<16} {:<20} {:>4} {:>8} {:>6} {:>6}  entry",
+            "SERVER", "LOCATION", "CC", "RTT", "LOAD", "SCORE"
         );
     }
+    for s in ranking.iter().take(limit) {
+        let measured = match (s.mbps, s.mbps_age_secs) {
+            (Some(mbps), Some(age)) => format!("{mbps:.0} Mbps {}", short_age(age)),
+            _ => String::new(),
+        };
+        if any_measured {
+            println!(
+                "{:<16} {:<20} {:>4} {:>6.1}ms {:>5}% {:>6.3} {:>12}  {}",
+                s.name,
+                truncate(&s.location, 20),
+                s.country_code,
+                s.rtt_ms,
+                s.load,
+                s.score,
+                measured,
+                s.entry
+            );
+        } else {
+            println!(
+                "{:<16} {:<20} {:>4} {:>6.1}ms {:>5}% {:>6.3}  {}",
+                s.name,
+                truncate(&s.location, 20),
+                s.country_code,
+                s.rtt_ms,
+                s.load,
+                s.score,
+                s.entry
+            );
+        }
+    }
     println!("\n{} servers ranked", ranking.len());
+    if !any_measured {
+        println!("run `vpnmgr speedtest` while connected to record a server's real speed");
+    }
+}
+
+/// Compact age for the measured-speed column.
+fn short_age(secs: u64) -> String {
+    match secs {
+        s if s < 90 => "now".to_owned(),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
 }
 
 /// Turn an AirVPN `.conf` into the files the daemon expects.

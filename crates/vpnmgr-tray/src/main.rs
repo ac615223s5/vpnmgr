@@ -110,6 +110,11 @@ impl VpnTray {
     /// Measured latency when a sweep has produced a ranking, since that is what
     /// makes a server a good choice. Falls back to the API's load figures before
     /// the first sweep, labelled as load so the two are not confusable.
+    ///
+    /// Servers that have actually been speed-tested show that figure too. It is
+    /// deliberately shown only where it was measured rather than estimated for
+    /// everything: a real number for three servers is more use than a guess for
+    /// two hundred.
     fn quick_connect_entries(&self) -> Vec<(String, String)> {
         if !self.ranking.is_empty() {
             return self
@@ -120,10 +125,15 @@ impl VpnTray {
                     (
                         s.name.clone(),
                         format!(
-                            "{} — {} ({:.0}ms, {}% load)",
+                            "{} — {} ({:.0}ms{}, {}% load)",
                             s.name,
                             truncate(&s.location, 22),
                             s.rtt_ms,
+                            match (s.mbps, s.mbps_age_secs) {
+                                (Some(mbps), Some(age)) =>
+                                    format!(", {mbps:.0} Mbps {}", measured_ago(age)),
+                                _ => String::new(),
+                            },
                             s.load
                         ),
                     )
@@ -657,6 +667,19 @@ async fn refresh(handle: &ksni::Handle<VpnTray>, socket: &PathBuf) {
             }
         })
         .await;
+}
+
+/// How long ago a throughput figure was taken, compactly.
+///
+/// Always shown alongside the number: an old measurement describes conditions
+/// that may be long gone, and presenting it bare would imply it still holds.
+fn measured_ago(secs: u64) -> String {
+    match secs {
+        s if s < 90 => "just now".to_owned(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
 }
 
 fn truncate(s: &str, width: usize) -> String {

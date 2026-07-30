@@ -221,6 +221,16 @@ pub struct RankedServer {
     pub score: f64,
     pub entry: u8,
     pub endpoint: SocketAddr,
+    /// Measured throughput, for servers that have actually been speed-tested.
+    ///
+    /// `None` for the overwhelming majority: a throughput test costs tens of
+    /// megabytes and is only ever run on the server you are connected to, so
+    /// this fills in gradually as you use them. Latency is what ranks servers;
+    /// this is recorded evidence, not a prediction.
+    pub mbps: Option<f64>,
+    /// Age of that measurement. A number from last week says much less than
+    /// one from ten minutes ago, so callers can show or discount it.
+    pub mbps_age_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -361,6 +371,8 @@ mod tests {
             score: 0.891,
             entry: 3,
             endpoint: "1.2.3.4:1637".parse().unwrap(),
+            mbps: Some(187.4),
+            mbps_age_secs: Some(600),
         }
     }
 
