@@ -61,6 +61,18 @@ pub struct Bypass {
     /// so connecting quietly makes their peers unreachable.
     #[serde(default = "default_true")]
     pub other_vpns: bool,
+    /// Keep the private address space reachable on the physical link.
+    ///
+    /// On by default, for the same reason as `other_vpns`: without it a full
+    /// tunnel silently swallows every private subnet that is *routed* rather
+    /// than attached. Your own subnet keeps working — it has a link route —
+    /// so the breakage looks arbitrary: the machine next to you answers and
+    /// the printer one subnet over does not.
+    ///
+    /// Private ranges the tunnel itself uses are excluded automatically, so
+    /// this cannot strand the tunnel's own nameservers.
+    #[serde(default = "default_true")]
+    pub lan: bool,
 }
 
 /// Settings for the Tier-2 throughput test.
@@ -416,6 +428,7 @@ impl Default for Bypass {
             cidrs: Vec::new(),
             hosts: Vec::new(),
             other_vpns: true,
+            lan: true,
         }
     }
 }

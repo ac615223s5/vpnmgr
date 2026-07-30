@@ -11,12 +11,26 @@
 //! ignore its default route". Anything with a *specific* route in `main`
 //! therefore wins outright. A bypass is just such a route.
 //!
-//! That is also why some things need no help:
+//! That is also why loopback needs no help: it is served by the `local` table
+//! at rule priority 0, ahead of everything.
 //!
-//! * **Loopback** is served by the `local` table at rule priority 0, ahead of
-//!   everything.
-//! * **The local network** already has a specific route in `main` — the link
-//!   route its interface installed — so it survives the suppression untouched.
+//! # The local network needs more help than it looks
+//!
+//! Your own subnet survives on its own — the link route its interface installed
+//! is specific, so the suppression leaves it alone. It is easy to conclude from
+//! that the local network is fine, and wrong.
+//!
+//! Anything *routed* rather than *attached* has no such route. A machine on
+//! `192.168.4.0/22` reaching a printer on `192.168.2.0/24` goes through the
+//! gateway, which is to say via the default route — exactly the route the
+//! tunnel suppresses. The printer becomes unreachable the moment you connect,
+//! with nothing in the routing table to hint at why.
+//!
+//! So the private ranges are bypassed as a whole, minus any range the tunnel
+//! itself occupies. That exception is not hypothetical: AirVPN hands out client
+//! addresses in `10.128.0.0/9` and a nameserver at `10.128.0.1`, so bypassing
+//! `10.0.0.0/8` outright would route the tunnel's own DNS at the local gateway
+//! and break name resolution for everything.
 //!
 //! # Other VPNs do need help
 //!
@@ -51,6 +65,15 @@ const VPN_INTERFACES: [&str; 6] = ["tailscale", "tun", "tap", "wg", "ppp", "zt"]
 /// discovery on the rest of the machine. They are already handled by the
 /// `local` table, which is consulted first.
 const NEVER_MIRROR: [&str; 4] = ["fe80:", "ff00:", "169.254.", "224.0.0."];
+
+/// The private address space, as the ranges a bypass would install.
+///
+/// Deliberately the same set the kill switch calls "LAN". The two used to
+/// disagree — the firewall accepted all of RFC1918 while the routing table sent
+/// most of it into the tunnel — which is a contradiction that presents as a
+/// destination that is allowed and still unreachable.
+const PRIVATE_V4: [&str; 3] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+const PRIVATE_V6: [&str; 1] = ["fc00::/7"];
 
 /// One route installed to keep a destination out of the tunnel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +115,87 @@ impl Route {
     }
 }
 
+/// What to keep out of the tunnel.
+///
+/// A struct rather than a parameter list because two of these are adjacent
+/// booleans, and `plan(cidrs, hosts, true, false, ...)` is a call nobody can
+/// read or get right twice.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Request<'a> {
+    /// Networks named in configuration.
+    pub cidrs: &'a [String],
+    /// Hostnames named in configuration, resolved when the tunnel comes up.
+    pub hosts: &'a [String],
+    /// Mirror the destinations served by other VPNs on this machine.
+    pub other_vpns: bool,
+    /// Keep the private address space on the physical link.
+    pub lan: bool,
+    /// Addresses the tunnel itself uses — its own interface addresses and its
+    /// nameservers. Any private range containing one of these is left in the
+    /// tunnel, where it belongs.
+    pub tunnel_addresses: &'a [IpAddr],
+    /// Our own interface, so it is never mistaken for another VPN to preserve.
+    pub our_interface: &'a str,
+}
+
+/// The private ranges safe to bypass, given what the tunnel occupies.
+///
+/// A range is dropped whole rather than split around the conflict. Splitting
+/// `10.0.0.0/8` around a nameserver would mean synthesising a dozen prefixes
+/// whose only purpose is to look thorough; leaving the range alone is honest
+/// about the fact that this tunnel lives there, and the `cidrs` list is the
+/// place to name a specific subnet that still needs to escape.
+fn lan_ranges(tunnel_addresses: &[IpAddr]) -> Vec<&'static str> {
+    PRIVATE_V4
+        .iter()
+        .chain(PRIVATE_V6.iter())
+        .copied()
+        .filter(|range| {
+            let conflict = tunnel_addresses
+                .iter()
+                .find(|addr| cidr_contains(range, **addr));
+            if let Some(addr) = conflict {
+                tracing::info!(
+                    range,
+                    %addr,
+                    "not bypassing this private range: the tunnel itself uses an address in it"
+                );
+            }
+            conflict.is_none()
+        })
+        .collect()
+}
+
+/// Whether `cidr` contains `addr`. Non-parsing input contains nothing, which
+/// keeps a malformed constant from silently widening a bypass.
+fn cidr_contains(cidr: &str, addr: IpAddr) -> bool {
+    let Some((network, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return false;
+    };
+    match (network.parse::<IpAddr>(), addr) {
+        (Ok(IpAddr::V4(net)), IpAddr::V4(addr)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(net) & mask == u32::from(addr) & mask
+        }
+        (Ok(IpAddr::V6(net)), IpAddr::V6(addr)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(net) & mask == u128::from(addr) & mask
+        }
+        _ => false,
+    }
+}
+
 /// Tracks the routes installed for this tunnel, so they can be withdrawn.
 #[derive(Debug, Default)]
 pub struct Bypass {
@@ -104,19 +208,11 @@ impl Bypass {
     }
 
     /// Work out what should bypass the tunnel.
-    ///
-    /// `cidrs` and `hosts` come from configuration; `include_other_vpns` adds
-    /// the destinations served by any other VPN interface on the machine.
-    pub fn plan(
-        cidrs: &[String],
-        hosts: &[String],
-        include_other_vpns: bool,
-        our_interface: &str,
-    ) -> Vec<Route> {
+    pub fn plan(request: &Request<'_>) -> Vec<Route> {
         let mut routes = Vec::new();
 
-        if include_other_vpns {
-            routes.extend(other_vpn_routes(our_interface));
+        if request.other_vpns {
+            routes.extend(other_vpn_routes(request.our_interface));
         }
 
         // Explicit destinations need the physical gateway, which is whatever
@@ -124,12 +220,21 @@ impl Bypass {
         // it is only suppressed by a rule, so this stays correct while
         // connected.
         let gateways = default_gateways();
-        for cidr in cidrs {
+
+        if request.lan {
+            for range in lan_ranges(request.tunnel_addresses) {
+                if let Some(route) = via_gateway(range, &gateways) {
+                    routes.push(route);
+                }
+            }
+        }
+
+        for cidr in request.cidrs {
             if let Some(route) = via_gateway(cidr, &gateways) {
                 routes.push(route);
             }
         }
-        for host in hosts {
+        for host in request.hosts {
             for addr in resolve(host) {
                 let dest = match addr {
                     IpAddr::V4(a) => a.to_string(),
@@ -444,18 +549,98 @@ mod tests {
 
     #[test]
     fn planning_is_deduplicated_and_ordered() {
-        let routes = Bypass::plan(
-            &["10.1.0.0/16".into(), "10.1.0.0/16".into()],
-            &[],
-            false,
-            "vpnmgr0",
-        );
+        let cidrs = ["10.1.0.0/16".to_owned(), "10.1.0.0/16".to_owned()];
+        let routes = Bypass::plan(&Request {
+            cidrs: &cidrs,
+            our_interface: "vpnmgr0",
+            ..Default::default()
+        });
         // Either the machine has no default route in a test environment, or the
         // duplicate collapsed; both are acceptable, a duplicate is not.
         assert!(
             routes.len() <= 1,
             "duplicate destinations were not collapsed"
         );
+    }
+
+    /// The bug this exists for: a private subnet reached through the gateway
+    /// has no route of its own to survive the suppression, so without a LAN
+    /// bypass it vanishes the moment the tunnel comes up.
+    #[test]
+    fn the_lan_bypass_covers_a_subnet_that_is_routed_rather_than_attached() {
+        let ranges = lan_ranges(&[]);
+        assert!(
+            ranges.contains(&"192.168.0.0/16"),
+            "a host on 192.168.2.0/24 would be swallowed by the tunnel"
+        );
+        assert_eq!(ranges.len(), PRIVATE_V4.len() + PRIVATE_V6.len());
+    }
+
+    /// AirVPN's nameserver is 10.128.0.1. Bypassing 10/8 would send the
+    /// tunnel's own DNS to the local gateway, which answers for none of it.
+    #[test]
+    fn a_private_range_the_tunnel_lives_in_is_left_alone() {
+        let dns: IpAddr = "10.128.0.1".parse().unwrap();
+        let ranges = lan_ranges(&[dns]);
+        assert!(
+            !ranges.contains(&"10.0.0.0/8"),
+            "would strand the tunnel DNS"
+        );
+        assert!(
+            ranges.contains(&"192.168.0.0/16"),
+            "unrelated ranges still apply"
+        );
+        assert!(ranges.contains(&"172.16.0.0/12"));
+    }
+
+    /// The client address is inside the tunnel too, and is the other way a
+    /// range can turn out to be occupied.
+    #[test]
+    fn the_tunnels_own_address_also_reserves_its_range() {
+        let addr: IpAddr = "10.129.64.12".parse().unwrap();
+        assert!(!lan_ranges(&[addr]).contains(&"10.0.0.0/8"));
+    }
+
+    #[test]
+    fn containment_respects_prefix_length_and_family() {
+        assert!(cidr_contains(
+            "192.168.0.0/16",
+            "192.168.2.200".parse().unwrap()
+        ));
+        assert!(!cidr_contains(
+            "192.168.0.0/16",
+            "192.169.0.1".parse().unwrap()
+        ));
+        assert!(cidr_contains("10.0.0.0/8", "10.128.0.1".parse().unwrap()));
+        assert!(!cidr_contains(
+            "172.16.0.0/12",
+            "172.32.0.1".parse().unwrap()
+        ));
+        assert!(cidr_contains(
+            "172.16.0.0/12",
+            "172.31.255.255".parse().unwrap()
+        ));
+        assert!(cidr_contains(
+            "fc00::/7",
+            "fd7a:115c:a1e0::1".parse().unwrap()
+        ));
+        // A v4 address is not inside a v6 range, however the bits line up.
+        assert!(!cidr_contains("fc00::/7", "10.0.0.1".parse().unwrap()));
+        // Malformed input must not widen anything.
+        assert!(!cidr_contains("not-a-cidr", "10.0.0.1".parse().unwrap()));
+        assert!(!cidr_contains(
+            "10.0.0.0/notanumber",
+            "10.0.0.1".parse().unwrap()
+        ));
+    }
+
+    /// Tailscale's own range is inside `fc00::/7` and `100.64/10`; the LAN
+    /// bypass must not claim its v6 ULA out from under it when Tailscale is
+    /// the thing being preserved.
+    #[test]
+    fn lan_ranges_can_be_reserved_by_a_tunnel_ula() {
+        let ula: IpAddr = "fd7a:115c:a1e0::cc35:213c".parse().unwrap();
+        assert!(!lan_ranges(&[ula]).contains(&"fc00::/7"));
     }
 
     #[test]
