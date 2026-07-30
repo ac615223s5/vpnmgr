@@ -159,6 +159,13 @@ pub struct StatusReport {
     pub last_tune: Option<String>,
     /// Seconds until the next scheduled tuning pass.
     pub next_tune_secs: Option<u64>,
+    /// What this connection managed with the tunnel down, when that has been
+    /// measured. Every judgement about whether a server is fast enough is made
+    /// relative to this, so it is worth showing rather than leaving implicit.
+    pub baseline_mbps: Option<f64>,
+    /// Age of that measurement. A line rate from last week describes a link
+    /// that may have changed, so it is never shown bare.
+    pub baseline_age_secs: Option<u64>,
 }
 
 /// A proposal raised under `switch_policy = "ask"`, held until the user
@@ -260,6 +267,12 @@ pub struct RankedServer {
     /// Age of that measurement. A number from last week says much less than
     /// one from ten minutes ago, so callers can show or discount it.
     pub mbps_age_secs: Option<u64>,
+    /// Spare capacity in Mbit/s, from the provider's own figures.
+    ///
+    /// Unlike `mbps` this is known for every server, because it costs nothing —
+    /// but it is the room the server has, not the rate you would get. The two
+    /// answer different questions and are shown as different things.
+    pub headroom_mbps: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -271,6 +284,8 @@ pub struct ServerSummary {
     pub load: u32,
     pub users: u32,
     pub healthy: bool,
+    /// Spare capacity in Mbit/s. See [`RankedServer::headroom_mbps`].
+    pub headroom_mbps: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -419,6 +434,7 @@ mod tests {
             endpoint: "1.2.3.4:1637".parse().unwrap(),
             mbps: Some(187.4),
             mbps_age_secs: Some(600),
+            headroom_mbps: 4200,
         }
     }
 
@@ -446,6 +462,8 @@ mod tests {
             pending_switch: Some(sample_pending()),
             last_tune: Some("Kornephoros is healthy at 5.4ms".into()),
             next_tune_secs: Some(1500),
+            baseline_mbps: Some(843.2),
+            baseline_age_secs: Some(900),
         }
     }
 
@@ -483,6 +501,7 @@ mod tests {
             load: 27,
             users: 300,
             healthy: true,
+            headroom_mbps: 4200,
         }]));
         response_roundtrip(Response::Servers(vec![]));
         response_roundtrip(Response::ok("connected"));

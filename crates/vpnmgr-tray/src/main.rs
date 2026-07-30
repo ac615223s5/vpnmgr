@@ -123,6 +123,11 @@ impl VpnTray {
     /// deliberately shown only where it was measured rather than estimated for
     /// everything: a real number for three servers is more use than a guess for
     /// two hundred.
+    ///
+    /// Headroom is shown for every server, because the provider gives it away
+    /// for free, and it is the third of the three things the ranking weighs.
+    /// It is labelled "free" rather than presented as a speed: it is the room
+    /// the server has, not the rate you would get through it.
     fn quick_connect_entries(&self) -> Vec<(String, String)> {
         if !self.ranking.is_empty() {
             return self
@@ -133,7 +138,7 @@ impl VpnTray {
                     (
                         s.name.clone(),
                         format!(
-                            "{} — {} ({:.0}ms{}, {}% load)",
+                            "{} — {} ({:.0}ms{}, {}% load, {} free)",
                             s.name,
                             truncate(&s.location, 22),
                             s.rtt_ms,
@@ -142,7 +147,8 @@ impl VpnTray {
                                     format!(", {mbps:.0} Mbps {}", measured_ago(age)),
                                 _ => String::new(),
                             },
-                            s.load
+                            s.load,
+                            rate(s.headroom_mbps as f64),
                         ),
                     )
                 })
@@ -155,14 +161,30 @@ impl VpnTray {
                 (
                     s.name.clone(),
                     format!(
-                        "{} — {} ({}% load)",
+                        "{} — {} ({}% load, {} free)",
                         s.name,
                         truncate(&s.location, 24),
-                        s.load
+                        s.load,
+                        rate(s.headroom_mbps as f64),
                     ),
                 )
             })
             .collect()
+    }
+
+    /// The measured no-VPN line rate, as a menu line.
+    ///
+    /// Worth its own line because it is the yardstick: "is this server fast
+    /// enough" is decided as a fraction of this number, so a user looking at a
+    /// server's measured speed has no way to judge it without knowing what the
+    /// line itself does. Absent until something has measured it.
+    fn baseline_line(&self) -> Option<String> {
+        let s = self.status.as_ref()?;
+        let mbps = s.baseline_mbps?;
+        Some(match s.baseline_age_secs {
+            Some(age) => format!("without VPN: {} ({})", rate(mbps), measured_ago(age)),
+            None => format!("without VPN: {}", rate(mbps)),
+        })
     }
 
     /// The one-line summary used for both the tooltip and the menu header.
@@ -225,6 +247,12 @@ impl Tray for VpnTray {
                 human_bytes(s.rx_bytes),
             );
         }
+        if let Some(baseline) = self.baseline_line() {
+            if !description.is_empty() {
+                description.push('\n');
+            }
+            description.push_str(&baseline);
+        }
         ToolTip {
             icon_name: self.icon_name(),
             title: self.headline(),
@@ -262,6 +290,11 @@ impl Tray for VpnTray {
                 },
                 if s.healthy { "healthy" } else { "NO TRAFFIC" },
             )));
+        }
+        // Shown whether or not a tunnel is up: disconnected is exactly when you
+        // are deciding what counts as a good server.
+        if let Some(baseline) = self.baseline_line() {
+            items.push(disabled(baseline));
         }
         if let Some(busy) = &self.busy {
             items.push(disabled(format!("{busy}…")));
@@ -739,6 +772,18 @@ fn measured_ago(secs: u64) -> String {
     }
 }
 
+/// A rate in Mbit/s, at a scale that stays readable in a menu.
+///
+/// Server headroom runs from tens of Mbit/s to well over ten thousand, and six
+/// digits in a menu label are noise — nobody is comparing 11400 against 11380.
+fn rate(mbps: f64) -> String {
+    if mbps >= 1000.0 {
+        format!("{:.1} Gbps", mbps / 1000.0)
+    } else {
+        format!("{mbps:.0} Mbps")
+    }
+}
+
 fn truncate(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         s.to_owned()
@@ -815,5 +860,121 @@ mod tests {
             lock_at("/proc/definitely/not/writable.lock"),
             Instance::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn rates_switch_to_gigabits_once_the_digits_stop_meaning_anything() {
+        assert_eq!(rate(84.0), "84 Mbps");
+        assert_eq!(rate(999.4), "999 Mbps");
+        assert_eq!(rate(1000.0), "1.0 Gbps");
+        assert_eq!(rate(11_400.0), "11.4 Gbps");
+    }
+
+    fn status_with_baseline(mbps: Option<f64>, age: Option<u64>) -> StatusReport {
+        StatusReport {
+            connected: false,
+            interface: "vpnmgr0".into(),
+            server: None,
+            location: None,
+            country_code: None,
+            endpoint: None,
+            entry: None,
+            last_handshake_secs: None,
+            healthy: false,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            last_sweep: None,
+            pending_switch: None,
+            last_tune: None,
+            next_tune_secs: None,
+            baseline_mbps: mbps,
+            baseline_age_secs: age,
+        }
+    }
+
+    fn tray_showing(status: Option<StatusReport>) -> VpnTray {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut tray = VpnTray::new(tx);
+        tray.status = status;
+        tray
+    }
+
+    /// The baseline is a claim about the line right now, so it is never shown
+    /// without saying how old it is.
+    #[test]
+    fn the_baseline_line_carries_its_age() {
+        let tray = tray_showing(Some(status_with_baseline(Some(843.2), Some(7200))));
+        assert_eq!(
+            tray.baseline_line().as_deref(),
+            Some("without VPN: 843 Mbps (2h ago)")
+        );
+    }
+
+    fn ranked(name: &str, headroom_mbps: u64) -> RankedServer {
+        RankedServer {
+            name: name.into(),
+            country_code: "ca".into(),
+            country_name: "Canada".into(),
+            location: "Toronto, Ontario".into(),
+            load: 27,
+            rtt_ms: 6.9,
+            score: 0.9,
+            entry: 3,
+            endpoint: "1.2.3.4:1637".parse().unwrap(),
+            mbps: None,
+            mbps_age_secs: None,
+            headroom_mbps,
+        }
+    }
+
+    /// Headroom is what separates two servers reporting the same load, so it
+    /// has to reach the label the user actually clicks.
+    #[test]
+    fn picker_labels_carry_headroom() {
+        let mut tray = tray_showing(Some(status_with_baseline(None, None)));
+        tray.ranking = vec![ranked("Kornephoros", 14_400), ranked("Angetenar", 756)];
+        let labels: Vec<String> = tray
+            .quick_connect_entries()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(
+            labels[0],
+            "Kornephoros — Toronto, Ontario (7ms, 27% load, 14.4 Gbps free)"
+        );
+        assert!(labels[1].ends_with("756 Mbps free)"), "{}", labels[1]);
+    }
+
+    /// The pre-sweep fallback list is a different code path, and it is the one
+    /// shown on a freshly started daemon.
+    #[test]
+    fn the_fallback_picker_carries_headroom_too() {
+        let mut tray = tray_showing(Some(status_with_baseline(None, None)));
+        tray.servers = vec![ServerSummary {
+            name: "Kornephoros".into(),
+            country_code: "ca".into(),
+            country_name: "Canada".into(),
+            location: "Toronto, Ontario".into(),
+            load: 27,
+            users: 345,
+            healthy: true,
+            headroom_mbps: 14_400,
+        }];
+        assert_eq!(
+            tray.quick_connect_entries()[0].1,
+            "Kornephoros — Toronto, Ontario (27% load, 14.4 Gbps free)"
+        );
+    }
+
+    /// Nothing has measured it yet on a fresh daemon, and inventing a figure
+    /// there would misrepresent the bar every server is judged against.
+    #[test]
+    fn no_baseline_line_until_something_has_measured_one() {
+        assert!(
+            tray_showing(Some(status_with_baseline(None, None)))
+                .baseline_line()
+                .is_none()
+        );
+        assert!(tray_showing(None).baseline_line().is_none());
     }
 }

@@ -85,10 +85,11 @@ pub struct State {
     /// long-lived, and a stale figure from before a restart would be worth less
     /// than the complexity of storing it.
     throughput_seen: std::collections::HashMap<String, (f64, Instant)>,
-    /// What the connection itself managed with the tunnel down, from the last
-    /// `vpnmgr baseline`. Anchors the capacity term to the user's real line
-    /// rate instead of a guess.
-    direct_mbps: Option<f64>,
+    /// What the connection itself managed with the tunnel down, and when.
+    /// Anchors the capacity term to the user's real line rate instead of a
+    /// guess. Timestamped because it is shown to the user, and a line rate
+    /// measured hours ago is a much weaker claim than one from a minute ago.
+    direct_mbps: Option<(f64, Instant)>,
     /// Outcome of the most recent tuning pass, for `vpnmgr status`.
     last_tune: Option<String>,
     /// When the last pass ran; the schedule is measured from here so a manual
@@ -242,8 +243,20 @@ impl State {
     fn scoring(&self) -> score::Scoring {
         score::Scoring::new(
             self.config.autotune.weights,
-            self.config.autotune.headroom_target_mbps(self.direct_mbps),
+            self.config
+                .autotune
+                .headroom_target_mbps(self.direct_mbps()),
         )
+    }
+
+    /// The last measured line rate, without its timestamp.
+    fn direct_mbps(&self) -> Option<f64> {
+        self.direct_mbps.map(|(mbps, _)| mbps)
+    }
+
+    /// Record a line rate measured with the tunnel down.
+    fn record_direct(&mut self, mbps: f64) {
+        self.direct_mbps = Some((mbps, Instant::now()));
     }
 
     /// A prober configured for the current connection state.
@@ -413,7 +426,7 @@ impl State {
         if should_measure {
             match self.measure_direct().await {
                 Ok(mbps) => {
-                    self.direct_mbps = Some(mbps);
+                    self.record_direct(mbps);
                     tracing::info!(
                         mbps = format!("{mbps:.1}"),
                         "measured this connection directly"
@@ -427,7 +440,7 @@ impl State {
         }
 
         let ranked = self.sweep(None).await?;
-        let target = self.config.autotune.acceptance_mbps(self.direct_mbps);
+        let target = self.config.autotune.acceptance_mbps(self.direct_mbps());
         let attempts = if should_measure {
             self.config.autotune.verify_candidates.min(ranked.len())
         } else {
@@ -579,6 +592,7 @@ impl State {
             endpoint: s.endpoint,
             mbps: None,
             mbps_age_secs: None,
+            headroom_mbps: s.server.headroom_mbps(),
         });
         let mut chosen = chosen.ok_or_else(|| Error::ServerUnreachable {
             server: name.to_owned(),
@@ -655,6 +669,8 @@ impl State {
                 pending_switch: self.pending_switch(),
                 last_tune: self.last_tune.clone(),
                 next_tune_secs: Some(self.time_until_next_tune().as_secs()),
+                baseline_mbps: self.direct_mbps(),
+                baseline_age_secs: self.direct_mbps.map(|(_, at)| at.elapsed().as_secs()),
             };
         };
 
@@ -688,6 +704,8 @@ impl State {
             pending_switch: self.pending_switch(),
             last_tune: self.last_tune.clone(),
             next_tune_secs: Some(self.time_until_next_tune().as_secs()),
+            baseline_mbps: self.direct_mbps(),
+            baseline_age_secs: self.direct_mbps.map(|(_, at)| at.elapsed().as_secs()),
         }
     }
 
@@ -734,6 +752,7 @@ impl State {
                 load: s.load,
                 users: s.users,
                 healthy: s.is_healthy(),
+                headroom_mbps: s.headroom_mbps(),
             })
             .collect();
         out.sort_by(|a, b| a.load.cmp(&b.load).then_with(|| a.name.cmp(&b.name)));
@@ -808,8 +827,14 @@ impl State {
 
         let sample = measure(&settings).await?;
         let meets_target = sample.mbps >= min_mbps;
-        if let Some(server) = &connected {
-            self.record_throughput(server, sample.mbps);
+        match &connected {
+            Some(server) => self.record_throughput(server, sample.mbps),
+            // With no tunnel up this measurement *is* the direct line rate —
+            // the same thing `baseline` goes to the trouble of dropping the
+            // tunnel to obtain. Recording it costs nothing and means a
+            // speedtest run while disconnected calibrates the target instead
+            // of being discarded.
+            None => self.record_direct(sample.mbps),
         }
 
         let verdict = match &connected {
@@ -875,7 +900,7 @@ impl State {
 
         // The direct figure is this connection's own ceiling, so it anchors the
         // capacity term from here on unless the user set target_mbps explicitly.
-        self.direct_mbps = Some(direct.mbps);
+        self.record_direct(direct.mbps);
 
         let meets_target = tunnelled.mbps >= min_mbps;
         // A ratio is what answers the question; absolute numbers on their own
@@ -951,6 +976,7 @@ impl State {
             endpoint: s.endpoint,
             mbps: measured.map(|(mbps, _)| *mbps),
             mbps_age_secs: measured.map(|(_, at)| at.elapsed().as_secs()),
+            headroom_mbps: s.server.headroom_mbps(),
         }
     }
 

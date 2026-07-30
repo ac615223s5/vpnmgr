@@ -315,6 +315,7 @@ mod tests {
             endpoint: "1.2.3.4:1637".parse().unwrap(),
             mbps: None,
             mbps_age_secs: None,
+            headroom_mbps: 1000,
         }
     }
 

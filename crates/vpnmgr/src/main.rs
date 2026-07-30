@@ -194,16 +194,17 @@ async fn main() -> ExitCode {
         }
         Response::Servers(servers) => {
             println!(
-                "{:<16} {:<20} {:<16} {:>5} {:>7}  health",
-                "SERVER", "LOCATION", "COUNTRY", "LOAD", "USERS"
+                "{:<16} {:<20} {:<16} {:>5} {:>9} {:>7}  health",
+                "SERVER", "LOCATION", "COUNTRY", "LOAD", "FREE", "USERS"
             );
             for s in &servers {
                 println!(
-                    "{:<16} {:<20} {:<16} {:>4}% {:>7}  {}",
+                    "{:<16} {:<20} {:<16} {:>4}% {:>9} {:>7}  {}",
                     s.name,
                     truncate(&s.location, 20),
                     truncate(&s.country_name, 16),
                     s.load,
+                    rate(s.headroom_mbps as f64),
                     s.users,
                     if s.healthy { "ok" } else { "DEGRADED" }
                 );
@@ -306,6 +307,20 @@ fn print_status(report: &StatusReport) {
         );
     }
 
+    // The yardstick every "fast enough" judgement is made against, so it
+    // belongs next to the connection it is judging rather than only in the
+    // output of the command that measured it.
+    if let Some(mbps) = report.baseline_mbps {
+        println!(
+            "\nwithout VPN: {} {}",
+            rate(mbps),
+            match report.baseline_age_secs {
+                Some(age) => format!("(measured {})", short_age(age)),
+                None => String::new(),
+            }
+        );
+    }
+
     if let Some(sweep) = &report.last_sweep {
         println!(
             "\nlast sweep: {}/{} reachable in {:.1}s, {}s ago",
@@ -358,15 +373,19 @@ fn print_ranking(ranking: &[RankedServer], limit: usize) {
     // which is most of them: a throughput test moves tens of megabytes and only
     // runs against the server you are connected to.
     let any_measured = ranking.iter().any(|s| s.mbps.is_some());
+    // FREE is spare capacity from the provider's figures, not a measurement.
+    // It sits beside LOAD and SCORE because those three are what the ranking
+    // actually weighs, and a score is hard to argue with when its inputs are
+    // not on screen.
     if any_measured {
         println!(
-            "{:<16} {:<20} {:>4} {:>8} {:>6} {:>6} {:>12}  entry",
-            "SERVER", "LOCATION", "CC", "RTT", "LOAD", "SCORE", "MEASURED"
+            "{:<16} {:<20} {:>4} {:>8} {:>6} {:>9} {:>6} {:>12}  entry",
+            "SERVER", "LOCATION", "CC", "RTT", "LOAD", "FREE", "SCORE", "MEASURED"
         );
     } else {
         println!(
-            "{:<16} {:<20} {:>4} {:>8} {:>6} {:>6}  entry",
-            "SERVER", "LOCATION", "CC", "RTT", "LOAD", "SCORE"
+            "{:<16} {:<20} {:>4} {:>8} {:>6} {:>9} {:>6}  entry",
+            "SERVER", "LOCATION", "CC", "RTT", "LOAD", "FREE", "SCORE"
         );
     }
     for s in ranking.iter().take(limit) {
@@ -376,24 +395,26 @@ fn print_ranking(ranking: &[RankedServer], limit: usize) {
         };
         if any_measured {
             println!(
-                "{:<16} {:<20} {:>4} {:>6.1}ms {:>5}% {:>6.3} {:>12}  {}",
+                "{:<16} {:<20} {:>4} {:>6.1}ms {:>5}% {:>9} {:>6.3} {:>12}  {}",
                 s.name,
                 truncate(&s.location, 20),
                 s.country_code,
                 s.rtt_ms,
                 s.load,
+                rate(s.headroom_mbps as f64),
                 s.score,
                 measured,
                 s.entry
             );
         } else {
             println!(
-                "{:<16} {:<20} {:>4} {:>6.1}ms {:>5}% {:>6.3}  {}",
+                "{:<16} {:<20} {:>4} {:>6.1}ms {:>5}% {:>9} {:>6.3}  {}",
                 s.name,
                 truncate(&s.location, 20),
                 s.country_code,
                 s.rtt_ms,
                 s.load,
+                rate(s.headroom_mbps as f64),
                 s.score,
                 s.entry
             );
@@ -402,6 +423,16 @@ fn print_ranking(ranking: &[RankedServer], limit: usize) {
     println!("\n{} servers ranked", ranking.len());
     if !any_measured {
         println!("run `vpnmgr speedtest` while connected to record a server's real speed");
+    }
+}
+
+/// A rate in Mbit/s, at a scale that fits a table column. Server headroom
+/// reaches five digits, where the last three carry no useful distinction.
+fn rate(mbps: f64) -> String {
+    if mbps >= 1000.0 {
+        format!("{:.1} Gbps", mbps / 1000.0)
+    } else {
+        format!("{mbps:.0} Mbps")
     }
 }
 
