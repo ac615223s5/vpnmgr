@@ -1,26 +1,55 @@
 //! Ranking of probed servers.
 //!
-//! Combines measured handshake RTT with the load and spare bandwidth AirVPN
+//! Combines measured handshake RTT with the load and spare capacity AirVPN
 //! reports, into a score in `0.0..=1.0` where **higher is better**.
+//!
+//! Capacity is scored as *absolute* headroom rather than as the spare-bandwidth
+//! fraction. The fraction was redundant: AirVPN's `currentload` is itself
+//! `bw / bw_max`, so weighting both counted utilisation twice under two names,
+//! and the nominal 0.6/0.3/0.1 split was really 0.6/0.4.
 //!
 //! RTT is scored *relative to the fastest candidate* rather than against an
 //! absolute scale, because what counts as a good RTT depends entirely on where
-//! the user is. It is a ratio (`fastest / rtt`) and not a min-max
-//! normalisation, which matters more than it sounds:
+//! the user is. It is scored on the logarithm of that ratio, which took two
+//! attempts to get right.
 //!
 //! A min-max normalisation spreads scores over the whole range present in the
 //! set, so with a fleet reaching 350ms the gap between a 6ms server and a 28ms
 //! one is 6% of the range — while a 20-point load difference is 20% of *its*
 //! range. Load then decides, and the tuner picks a server four times further
-//! away because it reports a lighter load. A ratio keeps "twice as slow" worth
-//! the same whether that is 5ms to 10ms or 100ms to 200ms, which is also how
-//! latency is actually experienced.
+//! away because it reports a lighter load.
+//!
+//! A plain ratio (`fastest / rtt`) fixes that but is badly shaped: it spends
+//! almost all its range on the first doubling. Going from 1x to 2x the best
+//! costs 0.5, while 10x to 20x costs 0.05 — the same multiplicative
+//! degradation priced ten times apart, and everything past ~10x squashed into
+//! a band too narrow to rank.
+//!
+//! Taking the log makes equal ratios cost equal score: 1x to 2x and 10x to 20x
+//! are both worth the same drop. That matches how latency is experienced —
+//! "twice as slow" means the same thing whether it is 5ms to 10ms or 100ms to
+//! 200ms — and keeps resolution across the whole usable range.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::airvpn::Server;
 use crate::config::Weights;
+
+/// A server this many times slower than the fastest scores zero on latency.
+///
+/// Not a claim that such a server is unusable, only that once something is
+/// twenty times further away than the best available, ranking it against other
+/// equally distant servers is meaningless — load and headroom should decide.
+const RTT_RATIO_FLOOR: f64 = 20.0;
+
+/// Headroom past this point stops counting, in Mbit/s.
+///
+/// Spare capacity only helps until it exceeds what the user's own connection
+/// can pull; a server with 12 Gbit/s free is not better than one with 2 Gbit/s
+/// free for anyone on a domestic link. Capping keeps this a penalty for
+/// servers running out of room rather than a bonus for large ones.
+const HEADROOM_ENOUGH_MBPS: f64 = 1000.0;
 
 /// A server together with its probe result.
 ///
@@ -51,7 +80,7 @@ pub struct Scored<'a> {
     /// Component scores, for `vpnmgr servers --explain`.
     pub rtt_score: f64,
     pub load_score: f64,
-    pub bandwidth_score: f64,
+    pub headroom_score: f64,
 }
 
 /// Rank measured servers best-first.
@@ -74,23 +103,28 @@ pub fn rank<'a>(measured: &[Measured<'a>], weights: &Weights) -> Vec<Scored<'a>>
         .map(|(_, _, _, d)| micros(*d))
         .fold(f64::INFINITY, f64::min);
 
-    let total_weight = weights.rtt + weights.load + weights.bandwidth;
+    let total_weight = weights.rtt + weights.load + weights.headroom;
 
     let mut out: Vec<Scored<'a>> = reachable
         .into_iter()
         .map(|(server, endpoint, entry, rtt)| {
-            // Ratio to the fastest candidate: 1.0 for the quickest, 0.5 for
-            // one twice as slow, and so on. Depends only on this server and
-            // the leader, so adding a distant outlier to the set cannot
-            // compress the fast servers together.
+            // Log of the ratio to the fastest candidate. Depends only on this
+            // server and the leader, so adding a distant outlier to the set
+            // cannot compress the fast servers together.
             let us = micros(rtt);
-            let rtt_score = if us <= f64::EPSILON { 1.0 } else { fastest / us };
+            let rtt_score = if us <= f64::EPSILON || fastest <= f64::EPSILON {
+                1.0
+            } else {
+                let ratio = (us / fastest).max(1.0);
+                (1.0 - ratio.ln() / RTT_RATIO_FLOOR.ln()).clamp(0.0, 1.0)
+            };
             let load_score = 1.0 - server.load_fraction();
-            let bandwidth_score = server.spare_bandwidth();
+            let headroom_score =
+                (server.headroom_mbps() as f64 / HEADROOM_ENOUGH_MBPS).clamp(0.0, 1.0);
 
             let score = (weights.rtt * rtt_score
                 + weights.load * load_score
-                + weights.bandwidth * bandwidth_score)
+                + weights.headroom * headroom_score)
                 / total_weight;
 
             Scored {
@@ -101,7 +135,7 @@ pub fn rank<'a>(measured: &[Measured<'a>], weights: &Weights) -> Vec<Scored<'a>>
                 score,
                 rtt_score,
                 load_score,
-                bandwidth_score,
+                headroom_score,
             }
         })
         .collect();
@@ -237,28 +271,63 @@ mod tests {
     /// of the load range, so a reported load figure outvoted a 4.5x measured
     /// latency difference.
     #[test]
-    fn a_four_times_closer_server_beats_a_lightly_loaded_distant_one() {
+    fn a_four_times_closer_server_wins_despite_a_heavier_load() {
         let list = list();
-        let mut healthy: Vec<_> = list.healthy().collect();
-        healthy.sort_by_key(|s| s.load);
-        // The extremes of the fleet, so load pulls as hard as it possibly can.
-        let (lightest, heaviest) = (healthy[0], healthy[healthy.len() - 1]);
-        assert!(lightest.load + 15 < heaviest.load, "fixture needs a real load spread");
+        // A realistic pairing rather than the fleet's extremes: a meaningful
+        // load gap, and enough headroom on both that capacity is not what
+        // decides it.
+        let mut candidates: Vec<_> = list
+            .healthy()
+            .filter(|s| s.headroom_mbps() >= 1000)
+            .collect();
+        candidates.sort_by_key(|s| s.load);
+        let light = candidates.first().copied().expect("fixture has servers");
+        let heavy = candidates
+            .iter()
+            .copied()
+            .find(|s| s.load >= light.load + 15)
+            .expect("fixture should span at least a 15-point load range");
 
-        let measured = vec![
-            measured(lightest, ms(28)),
-            measured(heaviest, ms(6)),
-        ];
+        // The heavier server is 4.5x closer, which is what should decide it.
+        let measured = vec![measured(light, ms(28)), measured(heavy, ms(6))];
         let ranked = rank(&measured, &Weights::default());
         assert_eq!(
-            ranked[0].server.name, heaviest.name,
-            "a 4.5x latency advantage must outweigh even the widest load gap"
+            ranked[0].server.name, heavy.name,
+            "a 4.5x latency advantage should beat a {}-point load gap",
+            heavy.load - light.load
         );
     }
 
-    /// The property that fixes the above: a server's RTT score depends only on
-    /// itself and the fastest candidate, so a distant outlier joining the set
-    /// cannot squeeze the fast servers together.
+    /// The deliberate limit of the above: latency does not win unconditionally.
+    /// A server with no capacity left is a bad destination however close it is,
+    /// and the score is expected to say so.
+    #[test]
+    fn a_saturated_server_loses_to_an_idle_one_even_when_much_closer() {
+        let list = list();
+        let saturated = list
+            .servers
+            .iter()
+            .max_by_key(|s| s.load)
+            .expect("fixture has servers");
+        let idle = list
+            .servers
+            .iter()
+            .min_by_key(|s| s.load)
+            .expect("fixture has servers");
+        assert!(saturated.load >= 100, "expected an oversubscribed server");
+        assert_eq!(saturated.headroom_mbps(), 0, "expected no capacity left");
+
+        let measured = vec![measured(idle, ms(28)), measured(saturated, ms(6))];
+        let ranked = rank(&measured, &Weights::default());
+        assert_eq!(
+            ranked[0].server.name, idle.name,
+            "a fully saturated server should not win on proximity alone"
+        );
+    }
+
+    /// The property that fixes the original bug: a server's RTT score depends
+    /// only on itself and the fastest candidate, so a distant outlier joining
+    /// the set cannot squeeze the fast servers together.
     #[test]
     fn rtt_scores_are_unaffected_by_a_distant_outlier() {
         let list = list();
@@ -291,8 +360,108 @@ mod tests {
                 server.name
             );
         }
-        // And the shape is the ratio we intend: 20ms scores half of 10ms.
-        assert!((score_of(&pair, &servers[1].name) - 0.5).abs() < 1e-9);
+    }
+
+    /// The shape the log curve exists to provide: the same *multiplicative*
+    /// degradation costs the same score wherever it happens. Under the previous
+    /// `fastest / rtt` ratio, 1x->2x cost 0.5 while 10x->20x cost 0.05.
+    #[test]
+    fn equal_latency_ratios_cost_equal_score() {
+        let list = list();
+        let servers: Vec<_> = list.healthy().take(4).collect();
+        let ranked = rank(
+            &[
+                measured(servers[0], ms(10)),
+                measured(servers[1], ms(20)),
+                measured(servers[2], ms(100)),
+                measured(servers[3], ms(200)),
+            ],
+            &Weights::default(),
+        );
+        let rtt_of = |name: &str| {
+            ranked
+                .iter()
+                .find(|s| s.server.name == name)
+                .expect("ranked")
+                .rtt_score
+        };
+        let first_doubling = rtt_of(&servers[0].name) - rtt_of(&servers[1].name);
+        let later_doubling = rtt_of(&servers[2].name) - rtt_of(&servers[3].name);
+        assert!(
+            (first_doubling - later_doubling).abs() < 1e-9,
+            "1x->2x cost {first_doubling:.4} but 10x->20x cost {later_doubling:.4}"
+        );
+        assert!(first_doubling > 0.2, "a doubling should be clearly penalised");
+    }
+
+    /// Capacity is scored as absolute headroom, and deliberately capped: past
+    /// the point where a server has more spare bandwidth than any domestic link
+    /// can pull, extra capacity is not worth anything. Two well-provisioned
+    /// servers should therefore tie, however different their size.
+    #[test]
+    fn ample_headroom_ties_at_the_cap() {
+        let list = list();
+        let mut ample: Vec<_> = list
+            .servers
+            .iter()
+            .filter(|s| s.headroom_mbps() >= 2000)
+            .collect();
+        ample.sort_by_key(|s| s.bw_max);
+        let (small, large) = (ample[0], ample[ample.len() - 1]);
+        assert!(large.bw_max > small.bw_max, "need different capacities");
+
+        let ranked = rank(
+            &[measured(small, ms(10)), measured(large, ms(10))],
+            &Weights::default(),
+        );
+        let of = |name: &str| {
+            ranked
+                .iter()
+                .find(|s| s.server.name == name)
+                .expect("ranked")
+                .headroom_score
+        };
+        assert_eq!(
+            of(&small.name),
+            of(&large.name),
+            "headroom is a penalty for scarcity, not a bonus for size"
+        );
+    }
+
+    /// Where the term earns its place: a server running out of room scores
+    /// below one with plenty, which is information `load` alone does not carry
+    /// once capacity differs.
+    #[test]
+    fn scarce_headroom_scores_below_ample_headroom() {
+        let list = list();
+        let scarce = list
+            .servers
+            .iter()
+            .filter(|s| s.bw_max > 0)
+            .min_by_key(|s| s.headroom_mbps())
+            .expect("fixture has servers");
+        let ample = list
+            .servers
+            .iter()
+            .max_by_key(|s| s.headroom_mbps())
+            .expect("fixture has servers");
+        assert!(scarce.headroom_mbps() < 1000, "expected a server short of room");
+
+        let ranked = rank(
+            &[measured(scarce, ms(10)), measured(ample, ms(10))],
+            &Weights::default(),
+        );
+        let of = |name: &str| {
+            ranked
+                .iter()
+                .find(|s| s.server.name == name)
+                .expect("ranked")
+                .headroom_score
+        };
+        assert!(
+            of(&scarce.name) < of(&ample.name),
+            "a server with no room left should be penalised"
+        );
     }
 
     #[test]
@@ -317,7 +486,7 @@ mod tests {
         healthy.sort_by_key(|s| s.load);
         let (light, heavy) = (healthy[0], healthy[healthy.len() - 1]);
         // Ignore load entirely: the slower-but-lighter server should lose.
-        let rtt_only = Weights { rtt: 1.0, load: 0.0, bandwidth: 0.0 };
+        let rtt_only = Weights { rtt: 1.0, load: 0.0, headroom: 0.0 };
         let measured = vec![
             measured(light, ms(200)),
             measured(heavy, ms(10)),

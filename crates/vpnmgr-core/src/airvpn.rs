@@ -122,16 +122,22 @@ impl Server {
         f64::from(self.load).min(100.0) / 100.0
     }
 
-    /// Fraction of provisioned bandwidth still free, 0.0–1.0.
+    /// Spare capacity in Mbit/s: provisioned minus what is in use.
     ///
-    /// Returns 0.0 when capacity is unknown or already saturated, so a server
-    /// with missing data is never preferred over one with measured headroom.
-    pub fn spare_bandwidth(&self) -> f64 {
+    /// Absolute rather than fractional, because the fraction is not independent
+    /// information. AirVPN's `currentload` *is* `bw / bw_max` — across all 257
+    /// servers the two never differ by more than one percentage point — so
+    /// scoring on the fraction counted load twice under two names. Absolute
+    /// headroom is genuinely different: two servers at 40% utilisation have the
+    /// same load but 1.2 Gbit/s and 12 Gbit/s of room respectively.
+    ///
+    /// Returns 0 when capacity is unknown, so a server with missing data is
+    /// never preferred over one with measured headroom.
+    pub fn headroom_mbps(&self) -> u64 {
         if self.bw_max == 0 {
-            return 0.0;
+            return 0;
         }
-        let used = self.bw as f64 / self.bw_max as f64;
-        (1.0 - used).clamp(0.0, 1.0)
+        self.bw_max.saturating_sub(self.bw)
     }
 
     /// Stable identifier used in configs, CLI arguments and blacklists.
@@ -263,12 +269,31 @@ mod tests {
     }
 
     #[test]
-    fn spare_bandwidth_is_a_unit_fraction() {
+    fn headroom_is_never_more_than_the_provisioned_capacity() {
         let list = fixture();
         assert!(
             list.servers
                 .iter()
-                .all(|s| (0.0..=1.0).contains(&s.spare_bandwidth()))
+                .all(|s| s.headroom_mbps() <= s.bw_max)
+        );
+    }
+
+    /// The reason headroom replaced the spare-bandwidth *fraction*: servers at
+    /// the same utilisation can have wildly different absolute room, and the
+    /// fraction threw that away while duplicating `load`.
+    #[test]
+    fn equal_utilisation_can_mean_very_different_headroom() {
+        let list = fixture();
+        let same_util: Vec<_> = list
+            .servers
+            .iter()
+            .filter(|s| s.bw_max > 0 && (38..=42).contains(&(s.bw * 100 / s.bw_max)))
+            .collect();
+        let min = same_util.iter().map(|s| s.headroom_mbps()).min().unwrap();
+        let max = same_util.iter().map(|s| s.headroom_mbps()).max().unwrap();
+        assert!(
+            max >= min * 5,
+            "expected a wide headroom spread at equal utilisation, got {min}..{max}"
         );
     }
 

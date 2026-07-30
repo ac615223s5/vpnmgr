@@ -169,9 +169,13 @@ pub struct Weights {
     /// Load reported by the API.
     #[serde(default = "default_w_load")]
     pub load: f64,
-    /// Spare bandwidth reported by the API.
-    #[serde(default = "default_w_bandwidth")]
-    pub bandwidth: f64,
+    /// Absolute spare capacity reported by the API.
+    ///
+    /// Accepts the old `bandwidth` key: this used to weight the spare-bandwidth
+    /// *fraction*, which turned out to be the same number as `load` and so
+    /// counted it twice. Existing configs keep working.
+    #[serde(default = "default_w_headroom", alias = "bandwidth")]
+    pub headroom: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -233,7 +237,7 @@ fn default_w_rtt() -> f64 {
 fn default_w_load() -> f64 {
     0.3
 }
-fn default_w_bandwidth() -> f64 {
+fn default_w_headroom() -> f64 {
     0.1
 }
 fn default_allow_lan() -> bool {
@@ -279,7 +283,7 @@ impl Default for Weights {
         Self {
             rtt: default_w_rtt(),
             load: default_w_load(),
-            bandwidth: default_w_bandwidth(),
+            headroom: default_w_headroom(),
         }
     }
 }
@@ -419,10 +423,10 @@ impl Config {
         }
 
         let w = &self.autotune.weights;
-        if w.rtt < 0.0 || w.load < 0.0 || w.bandwidth < 0.0 {
+        if w.rtt < 0.0 || w.load < 0.0 || w.headroom < 0.0 {
             return Err(Error::Config("autotune.weights must not be negative".into()));
         }
-        if w.rtt + w.load + w.bandwidth <= 0.0 {
+        if w.rtt + w.load + w.headroom <= 0.0 {
             return Err(Error::Config(
                 "at least one autotune.weights entry must be greater than 0".into(),
             ));
@@ -583,7 +587,7 @@ peer_public_key = "PyLCXAQT8KkM4T+dUsOQfn+Ub3pGxfGlxkIApuig+hk="
     #[test]
     fn rejects_all_zero_weights() {
         let text = format!(
-            "{MINIMAL}\n[autotune.weights]\nrtt = 0.0\nload = 0.0\nbandwidth = 0.0\n"
+            "{MINIMAL}\n[autotune.weights]\nrtt = 0.0\nload = 0.0\nheadroom = 0.0\n"
         );
         assert!(parse(&text).unwrap_err().to_string().contains("greater than 0"));
     }
