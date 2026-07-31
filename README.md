@@ -62,8 +62,24 @@ Two servers at 27% and 62% load can have 14.4 Gbps and 756 Mbps of room.
 - glibc 2.35 or newer for the release binaries; any Rust 1.85+ toolchain to
   build from source
 
-Windows support is designed for but not implemented — the tunnel backend is
-behind a trait with a WireGuard-NT implementation still to come.
+Windows 10/11 is supported too, with [WireGuard for
+Windows](https://www.wireguard.com/install/) installed — the daemon drives its
+tunnel service rather than shipping a driver of its own. The bypass list and
+kill switch are Linux-only so far; on Windows `vpnmgr killswitch on` reports
+that plainly instead of pretending.
+
+### On Windows
+
+```powershell
+winget install WireGuard.WireGuard
+# from an elevated prompt:
+vpnmgrd --install-service
+sc start vpnmgrd
+```
+
+Config lives at `C:\ProgramData\vpnmgr\config.toml`, clients reach the daemon
+over `\\.\pipe\vpnmgr`, and the pipe admits administrators and interactive
+users — so the CLI and tray need no elevation, only the service does.
 
 ## Install
 

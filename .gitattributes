@@ -1,0 +1,9 @@
+# Line endings are normalised to LF in the repository regardless of the
+# platform a commit is made from. This is not cosmetic: a shell script with
+# CRLF fails on Linux with an unreadable `\r: command not found`, and both
+# installers here are run by sh.
+* text=auto eol=lf
+
+# Never touched by normalisation.
+*.png binary
+*.ico binary

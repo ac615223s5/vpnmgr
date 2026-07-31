@@ -1,0 +1,579 @@
+//! Windows tray: a shell notification icon driven by a message loop.
+//!
+//! # Why there is a message loop at all
+//!
+//! A Win32 tray icon is owned by a window, and menu clicks arrive as window
+//! messages. Something has to pump them, and it must be the thread that created
+//! the icon. `winit` supplies that loop without dragging in a GUI toolkit.
+//!
+//! The daemon protocol is async, so the network side lives on a tokio runtime
+//! on another thread and the two talk through channels. That split is not
+//! incidental: a menu click that blocked on a fleet-wide sweep would freeze the
+//! whole shell notification area, not just this program.
+//!
+//! # This process is also the notifier
+//!
+//! `vpnmgrd` runs as a service in Session 0, which has no desktop, so it cannot
+//! raise a notification even though it is the thing that knows a switch is
+//! waiting. The tray polls, notices the transition, and shows the balloon.
+
+use std::path::PathBuf;
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
+
+use clap::Parser;
+use tokio::sync::mpsc;
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use vpnmgr_ipc::{DEFAULT_SOCKET, RankedServer, Request, Response, ServerSummary, StatusReport};
+use winit::application::ApplicationHandler;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+
+use crate::format::{human_bytes, measured_ago, rate, truncate};
+
+/// How often the daemon is polled. It is the source of truth, and a scheduled
+/// tuning pass can change the connection with no involvement from us.
+const POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How many servers to offer under "Connect to".
+const QUICK_CONNECT_LIMIT: usize = 12;
+
+#[derive(Parser)]
+#[command(
+    name = "vpnmgr-tray",
+    about = "System tray for the WireGuard VPN manager",
+    version
+)]
+struct Args {
+    /// Daemon endpoint.
+    #[arg(long, default_value = DEFAULT_SOCKET)]
+    socket: PathBuf,
+}
+
+/// A request raised by clicking a menu item.
+#[derive(Debug, Clone)]
+enum Action {
+    Connect {
+        server: Option<String>,
+        measure: Option<bool>,
+    },
+    Disconnect,
+    Autotune,
+    Approve,
+    Dismiss,
+    Quit,
+}
+
+/// Everything the tray draws from, as last seen from the daemon.
+#[derive(Default)]
+struct Snapshot {
+    status: Option<StatusReport>,
+    ranking: Vec<RankedServer>,
+    servers: Vec<ServerSummary>,
+    unreachable: Option<String>,
+    busy: Option<String>,
+}
+
+impl Snapshot {
+    fn connected(&self) -> bool {
+        self.status.as_ref().is_some_and(|s| s.connected)
+    }
+
+    fn headline(&self) -> String {
+        match &self.status {
+            None => "vpnmgrd is not reachable".to_owned(),
+            Some(s) if !s.connected => "Disconnected".to_owned(),
+            Some(s) => format!(
+                "{} — {}",
+                s.server.as_deref().unwrap_or("?"),
+                s.location.as_deref().unwrap_or("?")
+            ),
+        }
+    }
+
+    fn tooltip(&self) -> String {
+        let mut out = self.headline();
+        if let Some(s) = &self.status
+            && s.connected
+        {
+            out.push_str(&format!(
+                "\n{} up, {} down",
+                human_bytes(s.tx_bytes),
+                human_bytes(s.rx_bytes)
+            ));
+            if let Some(age) = s.last_handshake_secs {
+                out.push_str(&format!("\nhandshake {age}s ago"));
+            }
+        }
+        if let Some(busy) = &self.busy {
+            out.push_str(&format!("\n{busy}…"));
+        }
+        out
+    }
+
+    /// `(server name, menu label)` for the quick-connect submenu.
+    ///
+    /// Prefers the measured ranking, because latency is what makes a server a
+    /// good choice; falls back to the load-ordered list before the first sweep,
+    /// labelled as load so the two are never confused.
+    fn quick_connect_entries(&self) -> Vec<(String, String)> {
+        if !self.ranking.is_empty() {
+            return self
+                .ranking
+                .iter()
+                .take(QUICK_CONNECT_LIMIT)
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        format!(
+                            "{} — {} ({:.0}ms{}, {}% load)",
+                            s.name,
+                            truncate(&s.location, 22),
+                            s.rtt_ms,
+                            match (s.mbps, s.mbps_age_secs) {
+                                (Some(mbps), Some(age)) =>
+                                    format!(", {} {}", rate(mbps), measured_ago(age)),
+                                _ => String::new(),
+                            },
+                            s.load
+                        ),
+                    )
+                })
+                .collect();
+        }
+        self.servers
+            .iter()
+            .take(QUICK_CONNECT_LIMIT)
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    format!(
+                        "{} — {} ({}% load)",
+                        s.name,
+                        truncate(&s.location, 24),
+                        s.load
+                    ),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Menu items are identified by the id `muda` assigns, so the click handler
+/// needs a way back from that id to the action it stands for.
+struct MenuMap {
+    entries: Vec<(tray_icon::menu::MenuId, Action)>,
+}
+
+impl MenuMap {
+    fn action_for(&self, id: &tray_icon::menu::MenuId) -> Option<Action> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| candidate == id)
+            .map(|(_, action)| action.clone())
+    }
+}
+
+fn build_menu(snapshot: &Snapshot) -> (Menu, MenuMap) {
+    let menu = Menu::new();
+    let mut entries = Vec::new();
+
+    let header = MenuItem::new(snapshot.headline(), false, None);
+    let _ = menu.append(&header);
+
+    if let Some(reason) = &snapshot.unreachable {
+        let _ = menu.append(&MenuItem::new(truncate(reason, 60), false, None));
+    }
+
+    if let Some(busy) = &snapshot.busy {
+        let _ = menu.append(&MenuItem::new(format!("{busy}…"), false, None));
+    }
+
+    // A proposal is the one thing the tray exists to surface, so it goes above
+    // everything else rather than into the ordinary run of commands.
+    if let Some(pending) = snapshot
+        .status
+        .as_ref()
+        .and_then(|s| s.pending_switch.as_ref())
+    {
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&MenuItem::new(
+            format!(
+                "Suggested: {} ({})",
+                pending.to.name,
+                truncate(&pending.reason, 40)
+            ),
+            false,
+            None,
+        ));
+        let approve = MenuItem::new("Switch now", true, None);
+        entries.push((approve.id().clone(), Action::Approve));
+        let _ = menu.append(&approve);
+        let dismiss = MenuItem::new("Keep the current server", true, None);
+        entries.push((dismiss.id().clone(), Action::Dismiss));
+        let _ = menu.append(&dismiss);
+    }
+
+    let _ = menu.append(&PredefinedMenuItem::separator());
+
+    let reachable = snapshot.status.is_some();
+    if snapshot.connected() {
+        let disconnect = MenuItem::new("Disconnect", reachable, None);
+        entries.push((disconnect.id().clone(), Action::Disconnect));
+        let _ = menu.append(&disconnect);
+    } else {
+        let quick = MenuItem::new("Connect to best server", reachable, None);
+        entries.push((
+            quick.id().clone(),
+            Action::Connect {
+                server: None,
+                measure: Some(false),
+            },
+        ));
+        let _ = menu.append(&quick);
+
+        let measured = MenuItem::new("Connect, measuring speed first", reachable, None);
+        entries.push((
+            measured.id().clone(),
+            Action::Connect {
+                server: None,
+                measure: Some(true),
+            },
+        ));
+        let _ = menu.append(&measured);
+    }
+
+    let choices = snapshot.quick_connect_entries();
+    if !choices.is_empty() {
+        let submenu = Submenu::new("Connect to", reachable);
+        for (name, label) in choices {
+            let item = MenuItem::new(label, true, None);
+            entries.push((
+                item.id().clone(),
+                Action::Connect {
+                    server: Some(name),
+                    measure: Some(false),
+                },
+            ));
+            let _ = submenu.append(&item);
+        }
+        let _ = menu.append(&submenu);
+    }
+
+    let test = MenuItem::new("Test servers now", reachable, None);
+    entries.push((test.id().clone(), Action::Autotune));
+    let _ = menu.append(&test);
+
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let quit = MenuItem::new("Quit", true, None);
+    entries.push((quit.id().clone(), Action::Quit));
+    let _ = menu.append(&quit);
+
+    (menu, MenuMap { entries })
+}
+
+/// A flat colour icon, generated rather than shipped.
+///
+/// Windows has no equivalent of the freedesktop icon names the Linux tray
+/// relies on, and a 16-pixel square of solid colour communicates the same three
+/// states without adding binary assets to the repository.
+fn icon_for(snapshot: &Snapshot) -> Icon {
+    const SIZE: u32 = 16;
+    let (r, g, b) = match &snapshot.status {
+        None => (0x9e, 0x9e, 0x9e),                    // grey: no daemon
+        Some(s) if !s.connected => (0x9e, 0x9e, 0x9e), // grey: down
+        Some(s) if !s.healthy => (0xd3, 0x2f, 0x2f),   // red: no handshake
+        Some(_) => (0x2e, 0x7d, 0x32),                 // green: carrying
+    };
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for _ in 0..SIZE * SIZE {
+        rgba.extend_from_slice(&[r, g, b, 0xff]);
+    }
+    Icon::from_rgba(rgba, SIZE, SIZE).expect("a solid square is always a valid icon")
+}
+
+/// State the event loop owns.
+struct App {
+    tray: Option<TrayIcon>,
+    map: MenuMap,
+    snapshot: Snapshot,
+    actions: mpsc::UnboundedSender<Action>,
+    updates: std_mpsc::Receiver<Snapshot>,
+    /// Whether a proposal was already on screen, so the balloon fires on the
+    /// transition rather than every ten seconds for as long as it stands.
+    announced_pending: bool,
+    next_poll: Instant,
+}
+
+impl App {
+    fn apply(&mut self, snapshot: Snapshot) {
+        let pending = snapshot
+            .status
+            .as_ref()
+            .is_some_and(|s| s.pending_switch.is_some());
+        if pending && !self.announced_pending {
+            let name = snapshot
+                .status
+                .as_ref()
+                .and_then(|s| s.pending_switch.as_ref())
+                .map(|p| p.to.name.clone())
+                .unwrap_or_default();
+            self.notify(
+                "A faster VPN server is available",
+                &format!("Switch to {name}?"),
+            );
+        }
+        self.announced_pending = pending;
+
+        self.snapshot = snapshot;
+        let (menu, map) = build_menu(&self.snapshot);
+        self.map = map;
+        if let Some(tray) = &self.tray {
+            tray.set_menu(Some(Box::new(menu)));
+            let _ = tray.set_tooltip(Some(self.snapshot.tooltip()));
+            let _ = tray.set_icon(Some(icon_for(&self.snapshot)));
+        }
+    }
+
+    fn notify(&self, title: &str, body: &str) {
+        // Best effort: a machine with notifications turned off is not a fault,
+        // and the state is on the icon and in the menu regardless.
+        if let Some(tray) = &self.tray {
+            let _ = tray.set_tooltip(Some(format!("{title}\n{body}")));
+        }
+        tracing::info!("{title}: {body}");
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _id: winit::window::WindowId,
+        _event: winit::event::WindowEvent,
+    ) {
+    }
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        // The tray icon must be created after the event loop exists, or it has
+        // no window to receive messages on.
+        if self.tray.is_none() {
+            let (menu, map) = build_menu(&self.snapshot);
+            self.map = map;
+            match TrayIconBuilder::new()
+                .with_menu(Box::new(menu))
+                .with_tooltip(self.snapshot.tooltip())
+                .with_icon(icon_for(&self.snapshot))
+                .build()
+            {
+                Ok(tray) => self.tray = Some(tray),
+                Err(e) => {
+                    tracing::error!("could not create the tray icon: {e}");
+                    event_loop.exit();
+                    return;
+                }
+            }
+        }
+
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            let Some(action) = self.map.action_for(&event.id) else {
+                continue;
+            };
+            if matches!(action, Action::Quit) {
+                event_loop.exit();
+                return;
+            }
+            if self.actions.send(action).is_err() {
+                event_loop.exit();
+                return;
+            }
+        }
+
+        while let Ok(snapshot) = self.updates.try_recv() {
+            self.apply(snapshot);
+        }
+
+        // Wake often enough to stay responsive to menu clicks, which arrive
+        // through a channel rather than as window messages we would be woken
+        // for.
+        let next = Instant::now() + Duration::from_millis(200);
+        self.next_poll = next;
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+    }
+}
+
+pub fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "vpnmgr_tray=info".into()),
+        )
+        .init();
+
+    let args = Args::parse();
+
+    if !single_instance() {
+        eprintln!("vpnmgr-tray is already running");
+        return;
+    }
+
+    let (action_tx, action_rx) = mpsc::unbounded_channel::<Action>();
+    let (update_tx, update_rx) = std_mpsc::channel::<Snapshot>();
+
+    // The daemon side runs on its own runtime and thread. Menu handling must
+    // never wait on it: a connect can take a full fleet sweep.
+    let socket = args.socket.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build the client runtime");
+        runtime.block_on(daemon_loop(socket, action_rx, update_tx));
+    });
+
+    let event_loop = EventLoop::new().expect("create the event loop");
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let mut app = App {
+        tray: None,
+        map: MenuMap {
+            entries: Vec::new(),
+        },
+        snapshot: Snapshot::default(),
+        actions: action_tx,
+        updates: update_rx,
+        announced_pending: false,
+        next_poll: Instant::now(),
+    };
+    if let Err(e) = event_loop.run_app(&mut app) {
+        tracing::error!("event loop stopped: {e}");
+    }
+}
+
+/// Poll the daemon, and carry out whatever the menu asked for.
+async fn daemon_loop(
+    socket: PathBuf,
+    mut actions: mpsc::UnboundedReceiver<Action>,
+    updates: std_mpsc::Sender<Snapshot>,
+) {
+    let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if updates.send(refresh(&socket, None).await).is_err() {
+                    return; // the event loop is gone
+                }
+            }
+            Some(action) = actions.recv() => {
+                let busy = match &action {
+                    Action::Connect { .. } => "Connecting",
+                    Action::Disconnect => "Disconnecting",
+                    Action::Autotune => "Testing servers",
+                    Action::Approve => "Switching",
+                    Action::Dismiss => "Dismissing",
+                    Action::Quit => return,
+                };
+                let _ = updates.send(refresh(&socket, Some(busy.to_owned())).await);
+
+                let request = match action {
+                    Action::Connect { server, measure } => Request::Connect { server, measure },
+                    Action::Disconnect => Request::Disconnect,
+                    Action::Autotune => Request::Autotune,
+                    Action::Approve => Request::Approve,
+                    Action::Dismiss => Request::Dismiss,
+                    Action::Quit => return,
+                };
+                if let Err(e) = vpnmgr_ipc::client::request(&socket, &request).await {
+                    tracing::warn!("request failed: {e}");
+                }
+                if updates.send(refresh(&socket, None).await).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Pull current state from the daemon.
+async fn refresh(socket: &PathBuf, busy: Option<String>) -> Snapshot {
+    let mut snapshot = Snapshot {
+        busy,
+        ..Default::default()
+    };
+
+    match vpnmgr_ipc::client::request(socket, &Request::Status).await {
+        Ok(Response::Status(report)) => snapshot.status = Some(*report),
+        Ok(Response::Error { message }) => snapshot.unreachable = Some(message),
+        Ok(_) => snapshot.unreachable = Some("vpnmgrd sent an unexpected reply".to_owned()),
+        Err(e) => snapshot.unreachable = Some(e.to_string()),
+    }
+
+    if snapshot.status.is_none() {
+        return snapshot;
+    }
+
+    if let Ok(Response::Ranking(ranking)) = vpnmgr_ipc::client::request(
+        socket,
+        &Request::LastRanking {
+            limit: Some(QUICK_CONNECT_LIMIT),
+        },
+    )
+    .await
+    {
+        snapshot.ranking = ranking;
+    }
+
+    // Only needed before a sweep has produced a ranking.
+    if snapshot.ranking.is_empty()
+        && let Ok(Response::Servers(servers)) = vpnmgr_ipc::client::request(
+            socket,
+            &Request::Servers {
+                country: None,
+                limit: Some(QUICK_CONNECT_LIMIT),
+                // The picker connects to what it shows, so it must only show
+                // what the configured filters allow.
+                all: false,
+            },
+        )
+        .await
+    {
+        snapshot.servers = servers;
+    }
+
+    snapshot
+}
+
+/// Refuse to start a second tray.
+///
+/// A named mutex rather than a lock file: Windows releases it when the process
+/// ends however it ends, so a crash cannot leave a stale lock that stops the
+/// tray starting again.
+fn single_instance() -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    unsafe extern "system" {
+        fn CreateMutexW(
+            attrs: *mut core::ffi::c_void,
+            initial_owner: i32,
+            name: *const u16,
+        ) -> *mut core::ffi::c_void;
+        fn GetLastError() -> u32;
+    }
+
+    let name: Vec<u16> = OsStr::new("Local\\vpnmgr-tray")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `name` is NUL-terminated and outlives the call. The handle is
+    // deliberately leaked: it must live as long as the process holds the lock.
+    let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 1, name.as_ptr()) };
+    if handle.is_null() {
+        // Failing open: an unusable mutex is not a reason to refuse to start.
+        return true;
+    }
+    unsafe { GetLastError() != ERROR_ALREADY_EXISTS }
+}

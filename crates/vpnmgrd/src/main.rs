@@ -1,11 +1,20 @@
 //! The vpnmgr daemon.
 //!
-//! Runs as root, owns the tunnel, and serves a line-delimited JSON protocol on
-//! a Unix socket. Unprivileged clients (`vpnmgr`, the tray) drive it through
-//! that socket, so nothing else needs elevated privileges and the user is never
-//! prompted for a password to change servers.
+//! Runs privileged, owns the tunnel, and serves a line-delimited JSON protocol
+//! on a Unix socket or a Windows named pipe. Unprivileged clients (`vpnmgr`,
+//! the tray) drive it through that endpoint, so nothing else needs elevated
+//! privileges and the user is never prompted for a password to change servers.
+//!
+//! # Two ways to start
+//!
+//! Run from a terminal it behaves like any program, which is what makes it
+//! debuggable. Started by systemd or the Windows SCM it is a service. The only
+//! difference is where the shutdown signal comes from, so the body of the
+//! daemon is [`run_daemon`] and both paths call it.
 
 mod notify;
+#[cfg(target_os = "windows")]
+mod service;
 mod state;
 mod tuner;
 
@@ -13,10 +22,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
-use vpnmgr_ipc::{DEFAULT_SOCKET, MAX_LINE, Request, Response, SOCKET_GROUP};
+use vpnmgr_ipc::transport::Listener;
+use vpnmgr_ipc::{DEFAULT_SOCKET, MAX_LINE, Request, Response};
 
 use crate::state::State;
 
@@ -27,13 +36,73 @@ struct Args {
     #[arg(long, default_value = vpnmgr_core::config::DEFAULT_PATH)]
     config: PathBuf,
 
-    /// Unix socket to listen on.
+    /// Endpoint to listen on: a Unix socket path, or a named pipe on Windows.
     #[arg(long, default_value = DEFAULT_SOCKET)]
     socket: PathBuf,
+
+    /// Hand this process to the service control manager. Set by the service
+    /// registration; not useful to type.
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    service: bool,
+
+    /// Register the Windows service, then exit.
+    #[cfg(target_os = "windows")]
+    #[arg(long)]
+    install_service: bool,
+
+    /// Remove the Windows service, then exit.
+    #[cfg(target_os = "windows")]
+    #[arg(long)]
+    uninstall_service: bool,
 }
 
+fn main() {
+    #[cfg(target_os = "windows")]
+    {
+        let args = Args::parse();
+        if args.install_service {
+            match service::install(&args.config) {
+                Ok(()) => println!(
+                    "installed the {} service; start it with: sc start {}",
+                    service::SERVICE_NAME,
+                    service::SERVICE_NAME
+                ),
+                Err(e) => {
+                    eprintln!("could not install the service: {e}");
+                    eprintln!("this needs an elevated prompt");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if args.uninstall_service {
+            match service::uninstall() {
+                Ok(()) => println!("removed the {} service", service::SERVICE_NAME),
+                Err(e) => {
+                    eprintln!("could not remove the service: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if args.service {
+            // Blocks until the SCM stops us. Only fails when we were not
+            // actually launched as a service.
+            if let Err(e) = service::run() {
+                eprintln!("not running as a service: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+
+    run_daemon();
+}
+
+/// The daemon proper. Blocks until asked to stop, then tears the tunnel down.
 #[tokio::main]
-async fn main() {
+async fn run_daemon() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -51,7 +120,7 @@ async fn main() {
         }
     };
 
-    let listener = match bind(&args.socket) {
+    let mut listener = match bind(&args.socket) {
         Ok(listener) => listener,
         Err(e) => {
             tracing::error!("failed to bind {}: {e}", args.socket.display());
@@ -74,7 +143,7 @@ async fn main() {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         let state = Arc::clone(&state);
                         tokio::spawn(async move {
                             if let Err(e) = serve(stream, state).await {
@@ -105,33 +174,44 @@ async fn main() {
             tracing::error!("failed to disconnect cleanly: {e}");
         }
     }
+    // A Unix socket is a file and outlives the process; a named pipe is not,
+    // and disappears with its last handle.
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&args.socket);
 }
 
-fn bind(path: &std::path::Path) -> std::io::Result<UnixListener> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // A socket left behind by a crash would block binding.
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
+fn bind(path: &std::path::Path) -> std::io::Result<Listener> {
+    let listener = Listener::bind(path)?;
 
-    let listener = UnixListener::bind(path)?;
-
+    // On Windows the pipe's DACL is applied at creation, inside the transport;
+    // there is nothing to fix up afterwards and nothing to warn about.
+    #[cfg(unix)]
     match vpnmgr_ipc::socket_permissions(path) {
-        Ok(true) => tracing::info!("socket owned by group {SOCKET_GROUP} (mode 0660)"),
+        Ok(true) => tracing::info!(
+            "socket owned by group {} (mode 0660)",
+            vpnmgr_ipc::SOCKET_GROUP
+        ),
         Ok(false) => tracing::warn!(
-            "group {SOCKET_GROUP} does not exist, so the socket is root-only (mode 0600). \
-             Create it and add your user: sudo groupadd -f {SOCKET_GROUP} && \
-             sudo usermod -aG {SOCKET_GROUP} $USER"
+            "group {g} does not exist, so the socket is root-only (mode 0600). \
+             Create it and add your user: sudo groupadd -f {g} && \
+             sudo usermod -aG {g} $USER",
+            g = vpnmgr_ipc::SOCKET_GROUP
         ),
         Err(e) => tracing::warn!("could not set socket ownership: {e}"),
     }
+    #[cfg(windows)]
+    tracing::info!("pipe open to {}", vpnmgr_ipc::transport::ACCESS_DESCRIPTION);
 
     Ok(listener)
 }
 
+/// Resolve when the platform asks us to stop.
+///
+/// Unix has SIGTERM from the service manager and SIGINT from a terminal.
+/// Windows delivers Ctrl-C the same way for a console run; a service stop
+/// arrives through the service control handler instead and is bridged onto
+/// this by [`crate::service`].
+#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
@@ -142,7 +222,21 @@ async fn shutdown_signal() {
     }
 }
 
-async fn serve(stream: UnixStream, state: Arc<Mutex<State>>) -> std::io::Result<()> {
+#[cfg(windows)]
+async fn shutdown_signal() {
+    // Either route in: Ctrl-C when run from a terminal, or the service control
+    // manager when run as a service. Whichever arrives first must tear the
+    // tunnel down rather than leave a default route pointing at a dead adapter.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = service::stop_requested() => {}
+    }
+}
+
+async fn serve<S>(stream: S, state: Arc<Mutex<State>>) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
 

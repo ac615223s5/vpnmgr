@@ -6,9 +6,14 @@ license.workspace = true
 
 [dependencies]
 vpnmgr-core.workspace = true
-defguard_wireguard_rs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# Linux only. Its Windows backend loads wireguard.dll from a path relative to
+# the working directory and panics when that fails, and its peer operations are
+# no-ops there; the Windows backend drives wireguard.exe instead.
+[target.'cfg(target_os = "linux")'.dependencies]
+defguard_wireguard_rs.workspace = true
 
 [dev-dependencies]
 vpnmgr-probe.workspace = true

@@ -13,11 +13,15 @@
 //! machine, or a user who logged out are all normal, and none of them are a
 //! reason to disturb the tunnel.
 
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
 /// Below this, a uid belongs to a system account rather than a person.
+#[cfg(target_os = "linux")]
 const FIRST_HUMAN_UID: u32 = 1000;
 
 /// Urgency hint passed to `notify-send`. Only the levels the daemon actually
@@ -30,6 +34,7 @@ pub enum Urgency {
 }
 
 impl Urgency {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn as_str(self) -> &'static str {
         match self {
             Urgency::Normal => "normal",
@@ -42,6 +47,7 @@ impl Urgency {
 ///
 /// Blocking, but only for as long as `notify-send` takes to hand the message
 /// to the bus; call it from a blocking context.
+#[cfg(target_os = "linux")]
 pub fn desktop(summary: &str, body: &str, urgency: Urgency) {
     for (uid, gid) in sessions() {
         let result = Command::new("notify-send")
@@ -82,6 +88,7 @@ pub fn desktop(summary: &str, body: &str, urgency: Urgency) {
 }
 
 /// The `(uid, gid)` of every session that currently has a D-Bus socket.
+#[cfg(target_os = "linux")]
 fn sessions() -> Vec<(u32, u32)> {
     let Ok(entries) = std::fs::read_dir("/run/user") else {
         return Vec::new();
@@ -105,10 +112,25 @@ fn sessions() -> Vec<(u32, u32)> {
     out
 }
 
+/// Windows services run in Session 0, which has no desktop and cannot be given
+/// one -- that isolation is the whole point of it, and the reason the
+/// "Interactive Services Detection" shim was removed from Windows years ago.
+/// A service therefore has no way to raise a notification at all.
+///
+/// So the daemon records the event and the tray, which does run in the user's
+/// session and already polls for state, is what surfaces it. Keeping the same
+/// signature means the calling code does not have to know any of this.
+#[cfg(not(target_os = "linux"))]
+pub fn desktop(summary: &str, body: &str, urgency: Urgency) {
+    tracing::info!(?urgency, "{summary}: {body}");
+}
+
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn enumerating_sessions_never_panics() {
         // Works whether or not anyone is logged in, and on a machine with no
@@ -116,6 +138,7 @@ mod tests {
         let _ = sessions();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn system_accounts_are_not_treated_as_desktops() {
         // root has a /run/user/0 on some systems; notifying it is meaningless.

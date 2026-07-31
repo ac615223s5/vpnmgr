@@ -34,12 +34,24 @@ pub mod killswitch;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(target_os = "windows")]
+pub mod windows;
+
 #[cfg(target_os = "linux")]
 pub use bypass::Bypass;
 #[cfg(target_os = "linux")]
 pub use killswitch::Killswitch;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxTunnel;
+#[cfg(target_os = "windows")]
+pub use windows::WindowsTunnel;
+
+/// The backend for this platform, so callers name one type rather than
+/// repeating the same `cfg` at every use site.
+#[cfg(target_os = "linux")]
+pub type PlatformTunnel = LinuxTunnel;
+#[cfg(target_os = "windows")]
+pub type PlatformTunnel = WindowsTunnel;
 
 /// Firewall mark applied to the interface and to probe sockets.
 ///

@@ -15,3 +15,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-service.workspace = true

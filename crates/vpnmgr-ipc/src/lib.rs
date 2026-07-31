@@ -12,20 +12,39 @@
 //! socket's group ownership, applied by [`socket_permissions`].
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 pub mod client;
+pub mod transport;
 
-/// Default socket path. Under `/run` so it vanishes on reboot.
-pub const DEFAULT_SOCKET: &str = "/run/vpnmgr/sock";
+/// Where clients reach the daemon: a socket under `/run` on Unix, a named pipe
+/// on Windows. See [`transport`] for why access control lives there.
+pub const DEFAULT_SOCKET: &str = transport::DEFAULT_ENDPOINT;
 
 /// Group granted access to the socket.
 pub const SOCKET_GROUP: &str = "vpnmgr";
 
 /// Longest message accepted, to bound what a client can make the daemon buffer.
 pub const MAX_LINE: usize = 1024 * 1024;
+
+/// How to check the daemon is running. Both failures below are far more often
+/// a stopped service than a real fault, so the hint names the exact command.
+#[cfg(unix)]
+const DAEMON_HINT: &str = "is the daemon running? try: systemctl status vpnmgrd";
+#[cfg(windows)]
+const DAEMON_HINT: &str = "is the daemon running? try: sc query vpnmgrd";
+
+#[cfg(unix)]
+const ACCESS_HINT: &str = "add yourself to the 'vpnmgr' group: \
+                           sudo usermod -aG vpnmgr $USER\nthen log out and back in";
+/// On Windows the pipe already admits interactive users, so a refusal here is
+/// not something group membership fixes — it means the daemon is running under
+/// a desktop that is not yours, or you are reaching it over a network.
+#[cfg(windows)]
+const ACCESS_HINT: &str = "the daemon only accepts administrators and users logged in \
+                           at this machine, and never remote clients";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -290,21 +309,14 @@ pub struct ServerSummary {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error(
-        "cannot reach vpnmgrd at {path}: {source}\n\
-         is the daemon running? try: systemctl status vpnmgrd"
-    )]
+    #[error("cannot reach vpnmgrd at {path}: {source}\n{}", DAEMON_HINT)]
     Connect {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
 
-    #[error(
-        "permission denied opening {path}\n\
-         add yourself to the '{SOCKET_GROUP}' group: sudo usermod -aG {SOCKET_GROUP} $USER\n\
-         then log out and back in"
-    )]
+    #[error("permission denied opening {path}\n{}", ACCESS_HINT)]
     PermissionDenied { path: PathBuf },
 
     #[error("talking to vpnmgrd: {0}")]
@@ -328,7 +340,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// and will do what it is told, so anyone who can open the socket can control
 /// the VPN. Returns `Ok(false)` when the group does not exist, leaving the
 /// socket root-only rather than opening it up.
-pub fn socket_permissions(path: &Path) -> std::io::Result<bool> {
+///
+/// Windows has no equivalent step: a named pipe's access control is fixed when
+/// the pipe is created, so it is applied in [`transport`] rather than after the
+/// fact. There is no window in which the endpoint exists but is unprotected.
+#[cfg(unix)]
+pub fn socket_permissions(path: &std::path::Path) -> std::io::Result<bool> {
     use std::os::unix::fs::PermissionsExt;
 
     let Some(gid) = group_id(SOCKET_GROUP) else {
@@ -350,6 +367,7 @@ pub fn socket_permissions(path: &Path) -> std::io::Result<bool> {
 }
 
 /// Look up a group's gid by name.
+#[cfg(unix)]
 fn group_id(name: &str) -> Option<u32> {
     let c_name = std::ffi::CString::new(name).ok()?;
     // SAFETY: c_name is a valid NUL-terminated string. The returned pointer is
@@ -552,14 +570,34 @@ mod tests {
         assert!(matches!(e, Response::Error { message } if message == "no candidates"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_missing_group_is_reported_rather_than_guessed() {
         assert_eq!(group_id("definitely-not-a-real-group-9x8y7z"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn root_group_resolves() {
         // Present on every Linux system; sanity-checks the getgrnam binding.
         assert!(group_id("root").is_some() || group_id("wheel").is_some());
+    }
+
+    /// The endpoint has to be the kind of name its platform can actually open:
+    /// a filesystem path on Unix, and a name in the pipe namespace on Windows
+    /// — where a path would be created as a file and never accept a client.
+    #[test]
+    fn the_default_endpoint_suits_its_platform() {
+        if cfg!(windows) {
+            assert!(
+                DEFAULT_SOCKET.starts_with(r"\\.\pipe\"),
+                "{DEFAULT_SOCKET} is not in the named pipe namespace"
+            );
+        } else {
+            assert!(
+                DEFAULT_SOCKET.starts_with('/'),
+                "{DEFAULT_SOCKET} is not a path"
+            );
+        }
     }
 }

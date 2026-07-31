@@ -3,20 +3,20 @@
 use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
+use crate::transport::{self, ClientStream};
 use crate::{Error, Request, Response, Result};
 
 /// A connection to `vpnmgrd`.
 pub struct Client {
-    stream: BufReader<UnixStream>,
+    stream: BufReader<ClientStream>,
     path: PathBuf,
 }
 
 impl Client {
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let stream = UnixStream::connect(&path).await.map_err(|source| {
+        let stream = transport::connect(&path).await.map_err(|source| {
             // Permission denied is by far the most common failure and has a
             // specific fix, so it gets its own message.
             if source.kind() == std::io::ErrorKind::PermissionDenied {

@@ -14,8 +14,16 @@ use crate::error::{Error, Result};
 use crate::key::{PublicKey, SecretKey};
 use crate::wgconf::{Cidr, ClientConfig};
 
-/// Default config location on Linux.
+/// Default config location.
+///
+/// `ProgramData` is the Windows counterpart of `/etc`: machine-wide state that
+/// outlives any one user. It sits beside the key files, so the directory's
+/// access control is what protects them and it must not be world-writable.
+#[cfg(unix)]
 pub const DEFAULT_PATH: &str = "/etc/vpnmgr/config.toml";
+/// Default config location. See the Unix variant for the reasoning.
+#[cfg(windows)]
+pub const DEFAULT_PATH: &str = r"C:\ProgramData\vpnmgr\config.toml";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

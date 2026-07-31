@@ -6,9 +6,17 @@ license.workspace = true
 
 [dependencies]
 vpnmgr-ipc.workspace = true
-ksni.workspace = true
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# ksni speaks StatusNotifierItem over D-Bus, which exists only on Linux
+# desktops. The Windows tray is a Win32 shell icon and shares no code with it.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni.workspace = true
 libc.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon.workspace = true
+winit.workspace = true
