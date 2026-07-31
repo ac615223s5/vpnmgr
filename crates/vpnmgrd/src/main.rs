@@ -55,6 +55,14 @@ struct Args {
     #[cfg(target_os = "windows")]
     #[arg(long)]
     uninstall_service: bool,
+
+    /// Append logs here as well as to stderr.
+    ///
+    /// A Windows service has no console, so without this every diagnostic the
+    /// daemon produces is discarded -- including the reason a bypass route
+    /// failed to install.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
 }
 
 fn main() {
@@ -103,14 +111,28 @@ fn main() {
 /// The daemon proper. Blocks until asked to stop, then tears the tunnel down.
 #[tokio::main]
 async fn run_daemon() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "vpnmgrd=info,vpnmgr_tunnel=info".into()),
-        )
-        .init();
-
     let args = Args::parse();
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "vpnmgrd=info,vpnmgr_tunnel=info".into());
+    match args.log_file.as_ref().and_then(|path| {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    }) {
+        Some(file) => tracing_subscriber::fmt()
+            // No escape codes: this is read in a text editor, not a terminal.
+            .with_ansi(false)
+            .with_writer(move || file.try_clone().expect("duplicate the log handle"))
+            .with_env_filter(filter)
+            .init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
 
     let state = match State::load(args.config.clone()) {
         Ok(state) => Arc::new(Mutex::new(state)),

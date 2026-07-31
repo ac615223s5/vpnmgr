@@ -164,7 +164,26 @@ impl WindowsTunnel {
             ),
         }
 
-        let conf = vpnmgr_core::render::to_conf(spec.client, spec.endpoint);
+        // WireGuard for Windows turns on its own kill switch whenever a peer's
+        // AllowedIPs is exactly a default route: it installs WFP filters that
+        // drop anything not leaving through the tunnel. That is a reasonable
+        // default and it is fatal here, because it discards the very traffic
+        // the bypass routes exist to send out the physical link -- the routing
+        // table is correct and the packets die anyway.
+        //
+        // Splitting the default into its two halves covers exactly the same
+        // address space without matching the "is a default route" test, so the
+        // filters are not installed and a bypass can work. Only done when there
+        // is something to bypass; a plain full tunnel keeps the stronger
+        // behaviour.
+        let client;
+        let effective = if self.bypass.is_empty() {
+            spec.client
+        } else {
+            client = split_default_routes(spec.client);
+            &client
+        };
+        let conf = vpnmgr_core::render::to_conf(effective, spec.endpoint);
         std::fs::write(&self.conf_path, conf).map_err(|e| Error::Killswitch {
             operation: "writing the tunnel configuration",
             source: e,
@@ -363,6 +382,44 @@ impl Drop for WindowsTunnel {
             let _ = self.down();
         }
     }
+}
+
+/// A copy of `client` whose default routes are expressed as two halves.
+///
+/// `0.0.0.0/0` becomes `0.0.0.0/1` and `128.0.0.0/1`; `::/0` becomes `::/1` and
+/// `8000::/1`. The union is identical -- every address is still carried -- so
+/// this changes nothing about what the tunnel captures.
+fn split_default_routes(client: &vpnmgr_core::ClientConfig) -> vpnmgr_core::ClientConfig {
+    use vpnmgr_core::wgconf::Cidr;
+    let mut out = client.clone();
+    let mut allowed = Vec::with_capacity(out.allowed_ips.len() + 2);
+    for cidr in &out.allowed_ips {
+        match (cidr.addr, cidr.prefix) {
+            (std::net::IpAddr::V4(a), 0) if a.is_unspecified() => {
+                allowed.push(Cidr {
+                    addr: "0.0.0.0".parse().unwrap(),
+                    prefix: 1,
+                });
+                allowed.push(Cidr {
+                    addr: "128.0.0.0".parse().unwrap(),
+                    prefix: 1,
+                });
+            }
+            (std::net::IpAddr::V6(a), 0) if a.is_unspecified() => {
+                allowed.push(Cidr {
+                    addr: "::".parse().unwrap(),
+                    prefix: 1,
+                });
+                allowed.push(Cidr {
+                    addr: "8000::".parse().unwrap(),
+                    prefix: 1,
+                });
+            }
+            _ => allowed.push(*cidr),
+        }
+    }
+    out.allowed_ips = allowed;
+    out
 }
 
 /// One `wg show <interface> <field>` call.

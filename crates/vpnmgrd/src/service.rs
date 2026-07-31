@@ -36,6 +36,13 @@ pub const SERVICE_NAME: &str = "vpnmgrd";
 
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
+/// Where the service writes its log.
+///
+/// Deliberately not inside `C:\ProgramDatapnmgr`, which is stripped down to
+/// SYSTEM and Administrators to protect the key files -- a log nobody can read
+/// without elevation is most of the way to no log at all.
+pub const LOG_PATH: &str = r"C:\ProgramData\vpnmgr-logs\vpnmgrd.log";
+
 /// Signalled when the SCM asks us to stop.
 static SHUTDOWN: OnceLock<Notify> = OnceLock::new();
 
@@ -125,6 +132,10 @@ pub fn install(config: &std::path::Path) -> Result<(), windows_service::Error> {
             OsString::from("--service"),
             OsString::from("--config"),
             config.as_os_str().to_owned(),
+            // A service has no console. Without a log file its diagnostics are
+            // written to a handle nobody holds.
+            OsString::from("--log-file"),
+            OsString::from(LOG_PATH),
         ],
         dependencies: vec![],
         // LocalSystem: see the module docs.
