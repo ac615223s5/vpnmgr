@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::bypass::{Bypass, Route};
 use crate::{Error, Result, TunnelBackend, TunnelSpec, TunnelStatus};
 
 /// Stops a console window flashing up for every `wg show`. The tray polls
@@ -80,6 +81,10 @@ pub struct WindowsTunnel {
     /// Whether *we* installed the service, so `down` does not try to remove a
     /// tunnel somebody else owns.
     installed: bool,
+    /// Destinations to keep on the physical link, and the routes installed for
+    /// them once the tunnel is up.
+    bypass_plan: Vec<Route>,
+    bypass: Bypass,
 }
 
 impl WindowsTunnel {
@@ -102,7 +107,15 @@ impl WindowsTunnel {
             interface,
             conf_path,
             installed: false,
+            bypass_plan: Vec::new(),
+            bypass: Bypass::new(),
         })
+    }
+
+    /// Destinations that must not travel through the tunnel.
+    pub fn with_bypass(mut self, plan: Vec<Route>) -> Self {
+        self.bypass_plan = plan;
+        self
     }
 
     /// Whether a tunnel service for this interface currently exists.
@@ -174,6 +187,12 @@ impl TunnelBackend for WindowsTunnel {
             let _ = self.remove_service();
         }
 
+        // Before the tunnel, not after. Windows picks the longest matching
+        // prefix, so these beat the tunnel's default the moment it appears --
+        // but only if they are already there. Installing them afterwards
+        // leaves a window in which the LAN is unreachable.
+        self.bypass.install(std::mem::take(&mut self.bypass_plan));
+
         self.write_config(spec)?;
 
         run(
@@ -243,6 +262,7 @@ impl TunnelBackend for WindowsTunnel {
 
     fn down(&mut self) -> Result<()> {
         self.remove_service()?;
+        self.bypass.remove();
         // The key material has no reason to outlive the tunnel.
         if let Err(e) = std::fs::remove_file(&self.conf_path)
             && e.kind() != std::io::ErrorKind::NotFound

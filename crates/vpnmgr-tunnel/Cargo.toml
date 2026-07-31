@@ -18,3 +18,6 @@ defguard_wireguard_rs.workspace = true
 [dev-dependencies]
 vpnmgr-probe.workspace = true
 tokio.workspace = true
+# Examples are debugging tools; without a subscriber their tracing output --
+# which is where a failed route install explains itself -- goes nowhere.
+tracing-subscriber.workspace = true

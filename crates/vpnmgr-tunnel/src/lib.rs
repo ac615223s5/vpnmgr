@@ -27,7 +27,8 @@ use std::time::SystemTime;
 
 use vpnmgr_core::ClientConfig;
 
-#[cfg(target_os = "linux")]
+// The bypass is cross-platform: the planning is identical, and only the
+// commands that install a route differ.
 pub mod bypass;
 #[cfg(target_os = "linux")]
 pub mod killswitch;
@@ -37,7 +38,6 @@ pub mod linux;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-#[cfg(target_os = "linux")]
 pub use bypass::Bypass;
 #[cfg(target_os = "linux")]
 pub use killswitch::Killswitch;

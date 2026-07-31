@@ -776,37 +776,35 @@ impl State {
         #[allow(unused_mut)]
         let mut tunnel = PlatformTunnel::new(vpnmgr_tunnel::DEFAULT_INTERFACE)?;
 
+        // What the tunnel occupies, so a LAN bypass cannot route the tunnel's
+        // own addresses or nameservers back out of it. AirVPN's nameserver
+        // lives at 10.128.0.1, squarely inside a private range.
+        let mut tunnel_addresses: Vec<std::net::IpAddr> = self.client.dns.clone();
+        tunnel_addresses.extend(self.client.addresses.iter().map(|c| c.addr));
+
+        let plan = vpnmgr_tunnel::Bypass::plan(&vpnmgr_tunnel::bypass::Request {
+            cidrs: &self.config.bypass.cidrs,
+            hosts: &self.config.bypass.hosts,
+            other_vpns: self.config.bypass.other_vpns,
+            lan: self.config.bypass.lan,
+            tunnel_addresses: &tunnel_addresses,
+            our_interface: vpnmgr_tunnel::DEFAULT_INTERFACE,
+        });
+        if !plan.is_empty() {
+            tracing::info!(
+                destinations = plan.len(),
+                "routing some destinations around the tunnel"
+            );
+            tunnel = tunnel.with_bypass(plan);
+        }
+
         #[cfg(target_os = "linux")]
-        {
-            // What the tunnel occupies, so a LAN bypass cannot route the
-            // tunnel's own addresses or nameservers back out of it. AirVPN's
-            // nameserver lives at 10.128.0.1, squarely inside a private range.
-            let mut tunnel_addresses: Vec<std::net::IpAddr> = self.client.dns.clone();
-            tunnel_addresses.extend(self.client.addresses.iter().map(|c| c.addr));
-
-            let plan = vpnmgr_tunnel::Bypass::plan(&vpnmgr_tunnel::bypass::Request {
-                cidrs: &self.config.bypass.cidrs,
-                hosts: &self.config.bypass.hosts,
-                other_vpns: self.config.bypass.other_vpns,
-                lan: self.config.bypass.lan,
-                tunnel_addresses: &tunnel_addresses,
-                our_interface: vpnmgr_tunnel::DEFAULT_INTERFACE,
-            });
-            if !plan.is_empty() {
-                tracing::info!(
-                    destinations = plan.len(),
-                    "routing some destinations around the tunnel"
-                );
-                tunnel = tunnel.with_bypass(plan);
-            }
-
-            if self.config.killswitch.enabled {
-                tunnel = tunnel.with_killswitch(Killswitch::new(
-                    vpnmgr_tunnel::DEFAULT_INTERFACE,
-                    DEFAULT_FWMARK,
-                    self.config.killswitch.allow_lan,
-                ));
-            }
+        if self.config.killswitch.enabled {
+            tunnel = tunnel.with_killswitch(Killswitch::new(
+                vpnmgr_tunnel::DEFAULT_INTERFACE,
+                DEFAULT_FWMARK,
+                self.config.killswitch.allow_lan,
+            ));
         }
 
         Ok(tunnel)

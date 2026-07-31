@@ -55,6 +55,7 @@ use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
 /// Interface name prefixes treated as "another VPN".
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const VPN_INTERFACES: [&str; 6] = ["tailscale", "tun", "tap", "wg", "ppp", "zt"];
 
 /// Prefixes that must never be mirrored into `main`.
@@ -97,6 +98,19 @@ impl Route {
         self.destination.contains(':')
     }
 
+    /// The destination as a prefix. A bare address from a resolved host has no
+    /// length, and every tool that takes a route wants one.
+    fn prefix(&self) -> String {
+        if self.destination.contains('/') {
+            self.destination.clone()
+        } else if self.is_v6() {
+            format!("{}/128", self.destination)
+        } else {
+            format!("{}/32", self.destination)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn add_args(&self) -> Vec<String> {
         let mut args = vec!["route".into(), "add".into(), self.destination.clone()];
         match &self.via {
@@ -264,7 +278,7 @@ impl Bypass {
                 );
                 continue;
             }
-            if run_ip(route.is_v6(), &route.add_args()) {
+            if sys_add(&route) {
                 tracing::info!(destination = %route.destination, "bypassing the tunnel");
                 self.installed.push(route);
             } else {
@@ -279,12 +293,7 @@ impl Bypass {
     /// Withdraw every route we installed. Safe to call more than once.
     pub fn remove(&mut self) {
         for route in self.installed.drain(..) {
-            let args = vec![
-                "route".to_owned(),
-                "del".to_owned(),
-                route.destination.clone(),
-            ];
-            if !run_ip(route.is_v6(), &args) {
+            if !sys_del(&route) {
                 tracing::debug!(
                     destination = %route.destination,
                     "bypass route was already gone"
@@ -330,6 +339,7 @@ fn via_gateway(destination: &str, gateways: &[(String, String, bool)]) -> Option
 }
 
 /// `(gateway, device, is_v6)` for each default route in the main table.
+#[cfg(target_os = "linux")]
 fn default_gateways() -> Vec<(String, String, bool)> {
     let mut out = Vec::new();
     for (flag, v6) in [("-4", false), ("-6", true)] {
@@ -360,6 +370,7 @@ fn default_gateways() -> Vec<(String, String, bool)> {
 /// Searches every routing table, not just `main`, because the tools that own
 /// these interfaces generally keep their routes in a private table — which is
 /// precisely why the tunnel preempts them.
+#[cfg(target_os = "linux")]
 fn other_vpn_routes(our_interface: &str) -> Vec<Route> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
@@ -413,11 +424,13 @@ fn other_vpn_routes(our_interface: &str) -> Vec<Route> {
     out
 }
 
+#[cfg(target_os = "linux")]
 fn is_vpn_interface(name: &str) -> bool {
     VPN_INTERFACES.iter().any(|prefix| name.starts_with(prefix))
 }
 
 /// Whether `main` already routes this destination somewhere specific.
+#[cfg(target_os = "linux")]
 fn route_exists(route: &Route) -> bool {
     let flag = if route.is_v6() { "-6" } else { "-4" };
     ip_output(&[flag, "route", "show", &route.destination, "table", "main"])
@@ -442,6 +455,7 @@ fn resolve(host: &str) -> Vec<IpAddr> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn ip_output(args: &[&str]) -> Option<String> {
     let output = Command::new("ip").args(args).output().ok()?;
     output
@@ -450,6 +464,23 @@ fn ip_output(args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Install one route. Linux edits the `main` table directly.
+#[cfg(target_os = "linux")]
+fn sys_add(route: &Route) -> bool {
+    run_ip(route.is_v6(), &route.add_args())
+}
+
+#[cfg(target_os = "linux")]
+fn sys_del(route: &Route) -> bool {
+    let args = vec![
+        "route".to_owned(),
+        "del".to_owned(),
+        route.destination.clone(),
+    ];
+    run_ip(route.is_v6(), &args)
+}
+
+#[cfg(target_os = "linux")]
 fn run_ip(v6: bool, args: &[String]) -> bool {
     Command::new("ip")
         .arg(if v6 { "-6" } else { "-4" })
@@ -464,6 +495,8 @@ fn run_ip(v6: bool, args: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    // Asserts on `ip` argument construction, which only exists on Linux.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_gateway_route_names_both_gateway_and_device() {
         let gateways = vec![("192.168.1.1".into(), "eth0".into(), false)];
@@ -484,6 +517,8 @@ mod tests {
 
     /// A v6 destination must not be sent through a v4 gateway, which `ip` would
     /// reject and which would silently leave the destination in the tunnel.
+    // Asserts on `ip` argument construction, which only exists on Linux.
+    #[cfg(target_os = "linux")]
     #[test]
     fn address_families_are_not_mixed() {
         let v4_only = vec![("192.168.1.1".into(), "eth0".into(), false)];
@@ -494,6 +529,8 @@ mod tests {
         assert!(route.is_v6());
     }
 
+    // Asserts on `ip` argument construction, which only exists on Linux.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_device_route_omits_the_gateway() {
         let route = Route {
@@ -506,6 +543,8 @@ mod tests {
         );
     }
 
+    // Asserts on `ip` argument construction, which only exists on Linux.
+    #[cfg(target_os = "linux")]
     #[test]
     fn vpn_interfaces_are_recognised_by_name() {
         for name in ["tailscale0", "tun0", "wg0", "ppp0", "zt7x", "tap5"] {
@@ -654,4 +693,214 @@ mod tests {
         assert!(bypass.is_empty());
         assert!(bypass.destinations().is_empty());
     }
+}
+
+// ---- Windows -------------------------------------------------------------
+//
+// The mechanism differs but the conclusion is the same. Windows has no policy
+// rules and no `suppress_prefixlength`: it picks the route with the longest
+// matching prefix, and breaks ties on metric. The tunnel's own route is a
+// default, so *any* more specific route beats it outright — which is exactly
+// what a bypass is, just as on Linux.
+//
+// Routes are added with `store=active`, so they live in memory only. A reboot
+// clears them, which is right: the tunnel they were installed around will not
+// have survived either, and a persistent bypass for a tunnel that is down is
+// just a routing table nobody asked for.
+//
+// PowerShell rather than `route print`, because `route print` is localised --
+// its column headings and the word "Gateway" change with the system language,
+// and parsing them would work on this machine and fail on a German one.
+
+#[cfg(target_os = "windows")]
+mod win {
+    use super::*;
+
+    /// Interface alias fragments that mean "another VPN".
+    ///
+    /// Matched against the adapter's friendly name, which is what Windows
+    /// exposes; there is no equivalent of Linux's `tun`/`wg` device naming.
+    const VPN_ALIASES: [&str; 6] = [
+        "tailscale",
+        "wireguard",
+        "wintun",
+        "openvpn",
+        "tap-",
+        "zerotier",
+    ];
+
+    /// Run PowerShell and return stdout, or None if it failed.
+    ///
+    /// `-NoProfile` matters: a user profile that prints anything would end up
+    /// parsed as route data.
+    pub(super) fn ps(script: &str) -> Option<String> {
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// `(gateway, interface index, is_v6)` for each usable default route.
+    ///
+    /// Excludes the tunnel's own default, which has no next hop -- WireGuard
+    /// installs its default on-link. Picking that would route the bypass back
+    /// into the tunnel it is meant to escape, which is the one outcome worth
+    /// guarding against here.
+    pub(super) fn default_gateways() -> Vec<(String, String, bool)> {
+        let mut out = Vec::new();
+        for (family, v6) in [("0.0.0.0/0", false), ("::/0", true)] {
+            let script = format!(
+                "Get-NetRoute -DestinationPrefix '{family}' -ErrorAction SilentlyContinue | \
+                 Where-Object {{ $_.NextHop -ne '0.0.0.0' -and $_.NextHop -ne '::' }} | \
+                 Sort-Object RouteMetric | Select-Object -First 1 | \
+                 ForEach-Object {{ \"$($_.NextHop)`t$($_.ifIndex)\" }}"
+            );
+            let Some(text) = ps(&script) else { continue };
+            if let Some(line) = text.lines().next() {
+                let mut parts = line.split('\t');
+                if let (Some(gateway), Some(index)) = (parts.next(), parts.next()) {
+                    let (gateway, index) = (gateway.trim(), index.trim());
+                    if !gateway.is_empty() && !index.is_empty() {
+                        out.push((gateway.to_owned(), index.to_owned(), v6));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Destinations served by other VPN adapters on this machine.
+    pub(super) fn other_vpn_routes(our_interface: &str) -> Vec<Route> {
+        let script = "Get-NetRoute -ErrorAction SilentlyContinue | \
+                      ForEach-Object { \"$($_.DestinationPrefix)`t$($_.ifIndex)`t$($_.InterfaceAlias)\" }";
+        let Some(text) = ps(script) else {
+            return Vec::new();
+        };
+
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let mut parts = line.split('\t');
+            let (Some(destination), Some(index), Some(alias)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let (destination, index, alias) = (destination.trim(), index.trim(), alias.trim());
+
+            // A default route from another VPN would swallow everything and
+            // defeat the tunnel entirely.
+            if destination == "0.0.0.0/0" || destination == "::/0" {
+                continue;
+            }
+            if NEVER_MIRROR.iter().any(|p| destination.starts_with(p)) {
+                continue;
+            }
+            let lower = alias.to_ascii_lowercase();
+            if lower.contains(&our_interface.to_ascii_lowercase()) {
+                continue;
+            }
+            if !VPN_ALIASES.iter().any(|p| lower.contains(p)) {
+                continue;
+            }
+            if !seen.insert(destination.to_owned()) {
+                continue;
+            }
+            out.push(Route {
+                destination: destination.to_owned(),
+                via: Via::Device(index.to_owned()),
+            });
+        }
+        out
+    }
+
+    /// Whether this exact prefix is already routed.
+    pub(super) fn route_exists(route: &Route) -> bool {
+        let script = format!(
+            "Get-NetRoute -DestinationPrefix '{}' -ErrorAction SilentlyContinue | \
+             Select-Object -First 1 | ForEach-Object {{ 'yes' }}",
+            route.prefix()
+        );
+        ps(&script).is_some_and(|s| s.trim() == "yes")
+    }
+
+    fn netsh(route: &Route, verb: &str, extra: &[String]) -> bool {
+        let family = if route.is_v6() { "ipv6" } else { "ipv4" };
+        let index = match &route.via {
+            Via::Device(index) => index.clone(),
+            Via::Gateway { device, .. } => device.clone(),
+        };
+        let mut args = vec![
+            "interface".to_owned(),
+            family.to_owned(),
+            verb.to_owned(),
+            "route".to_owned(),
+            format!("prefix={}", route.prefix()),
+            format!("interface={index}"),
+        ];
+        args.extend_from_slice(extra);
+        match Command::new("netsh").args(&args).output() {
+            Ok(out) if out.status.success() => true,
+            Ok(out) => {
+                // netsh reports "requires elevation" on stdout, not stderr, and
+                // discarding it turns a fixable permission problem into an
+                // unexplained "could not install a bypass route".
+                let reason: String = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .chain(String::from_utf8_lossy(&out.stderr).lines())
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("no output")
+                    .to_owned();
+                tracing::warn!(destination = %route.destination, "netsh {verb} route: {reason}");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(destination = %route.destination, "could not run netsh: {e}");
+                false
+            }
+        }
+    }
+
+    pub(super) fn add(route: &Route) -> bool {
+        let mut extra = vec!["store=active".to_owned()];
+        if let Via::Gateway { gateway, .. } = &route.via {
+            extra.insert(0, format!("nexthop={gateway}"));
+        }
+        netsh(route, "add", &extra)
+    }
+
+    pub(super) fn del(route: &Route) -> bool {
+        netsh(route, "delete", &["store=active".to_owned()])
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn default_gateways() -> Vec<(String, String, bool)> {
+    win::default_gateways()
+}
+
+#[cfg(target_os = "windows")]
+fn other_vpn_routes(our_interface: &str) -> Vec<Route> {
+    win::other_vpn_routes(our_interface)
+}
+
+#[cfg(target_os = "windows")]
+fn route_exists(route: &Route) -> bool {
+    win::route_exists(route)
+}
+
+#[cfg(target_os = "windows")]
+fn sys_add(route: &Route) -> bool {
+    win::add(route)
+}
+
+#[cfg(target_os = "windows")]
+fn sys_del(route: &Route) -> bool {
+    win::del(route)
 }

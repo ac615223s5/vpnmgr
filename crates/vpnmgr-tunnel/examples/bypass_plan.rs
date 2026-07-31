@@ -8,81 +8,71 @@
 //! contains it. Together those reproduce what the daemon plans on connect,
 //! while the tunnel stays down.
 
-// Linux-only: this example inspects Linux policy-routing rules, so on other
-// platforms it compiles to a message instead of failing the build.
-#[cfg(target_os = "linux")]
-mod imp {
-    use std::net::IpAddr;
+use std::net::IpAddr;
 
-    use vpnmgr_tunnel::Bypass;
-    use vpnmgr_tunnel::bypass::Request;
+use vpnmgr_tunnel::Bypass;
+use vpnmgr_tunnel::bypass::Request;
 
-    fn main() {
-        let mut args: Vec<String> = std::env::args().skip(1).collect();
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter("vpnmgr_tunnel=info")
+        .init();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
 
-        // `--apply` installs the routes and then withdraws them, to prove the
-        // mechanism works without needing a tunnel. The routes it adds duplicate
-        // paths that already exist, so they change nothing while installed.
-        let apply = args.iter().any(|a| a == "--apply");
-        let lan = args.iter().any(|a| a == "--lan");
+    // `--apply` installs the routes and then withdraws them, to prove the
+    // mechanism works without needing a tunnel. The routes it adds duplicate
+    // paths that already exist, so they change nothing while installed.
+    let apply = args.iter().any(|a| a == "--apply");
+    let lan = args.iter().any(|a| a == "--lan");
 
-        let mut reserved: Vec<IpAddr> = Vec::new();
-        let mut rest: Vec<String> = Vec::new();
-        let mut it = args.drain(..);
-        while let Some(arg) = it.next() {
-            match arg.as_str() {
-                "--apply" | "--lan" => {}
-                "--reserve" => match it.next().map(|a| a.parse::<IpAddr>()) {
-                    Some(Ok(addr)) => reserved.push(addr),
-                    _ => {
-                        eprintln!("--reserve needs an IP address");
-                        std::process::exit(2);
-                    }
-                },
-                _ => rest.push(arg),
-            }
+    let mut reserved: Vec<IpAddr> = Vec::new();
+    let mut rest: Vec<String> = Vec::new();
+    let mut it = args.drain(..);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--apply" | "--lan" => {}
+            "--reserve" => match it.next().map(|a| a.parse::<IpAddr>()) {
+                Some(Ok(addr)) => reserved.push(addr),
+                _ => {
+                    eprintln!("--reserve needs an IP address");
+                    std::process::exit(2);
+                }
+            },
+            _ => rest.push(arg),
         }
-
-        let plan = Bypass::plan(&Request {
-            cidrs: &[],
-            hosts: &rest,
-            other_vpns: true,
-            lan,
-            tunnel_addresses: &reserved,
-            our_interface: "vpnmgr0",
-        });
-        if plan.is_empty() {
-            println!("nothing would bypass the tunnel");
-            return;
-        }
-        println!("{} destination(s) would bypass the tunnel:", plan.len());
-        for route in &plan {
-            println!("  {:<24} {:?}", route.destination, route.via);
-        }
-
-        if !apply {
-            return;
-        }
-
-        let mut bypass = Bypass::new();
-        bypass.install(plan);
-        println!("\ninstalled {} route(s):", bypass.destinations().len());
-        for d in bypass.destinations() {
-            println!("  {d}");
-        }
-        println!("\n-- verify with `ip route show table main` now --");
-        std::thread::sleep(std::time::Duration::from_secs(6));
-        bypass.remove();
-        println!("withdrawn");
     }
-}
 
-#[cfg(target_os = "linux")]
-fn main() {
-    imp::main()
-}
+    let plan = Bypass::plan(&Request {
+        cidrs: &[],
+        hosts: &rest,
+        other_vpns: true,
+        lan,
+        tunnel_addresses: &reserved,
+        our_interface: "vpnmgr0",
+    });
+    if plan.is_empty() {
+        println!("nothing would bypass the tunnel");
+        return;
+    }
+    println!("{} destination(s) would bypass the tunnel:", plan.len());
+    for route in &plan {
+        println!("  {:<24} {:?}", route.destination, route.via);
+    }
 
-#[cfg(not(target_os = "linux"))]
-fn main() {
-    eprintln!("bypass_plan is a Linux-only tool: it inspects Linux policy-routing rules.");
+    if !apply {
+        return;
+    }
+
+    let mut bypass = Bypass::new();
+    bypass.install(plan);
+    println!("\ninstalled {} route(s):", bypass.destinations().len());
+    for d in bypass.destinations() {
+        println!("  {d}");
+    }
+    println!(
+        "\n-- verify with `Get-NetRoute` (Windows) or `ip route show table main` (Linux) now --"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    bypass.remove();
+    println!("withdrawn");
 }
