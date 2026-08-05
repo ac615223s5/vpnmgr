@@ -313,24 +313,85 @@ fn build_menu(snapshot: &Snapshot) -> (Menu, MenuMap) {
     (menu, MenuMap { entries })
 }
 
-/// A flat colour icon, generated rather than shipped.
-///
-/// Windows has no equivalent of the freedesktop icon names the Linux tray
-/// relies on, and a 16-pixel square of solid colour communicates the same three
-/// states without adding binary assets to the repository.
-fn icon_for(snapshot: &Snapshot) -> Icon {
-    const SIZE: u32 = 16;
-    let (r, g, b) = match &snapshot.status {
-        None => (0x9e, 0x9e, 0x9e),                    // grey: no daemon
-        Some(s) if !s.connected => (0x9e, 0x9e, 0x9e), // grey: down
+/// The state colour: what the icon is saying, separate from how it is drawn.
+fn state_colour(snapshot: &Snapshot) -> (u8, u8, u8) {
+    match &snapshot.status {
+        None => (0x75, 0x75, 0x75),                    // grey: no daemon
+        Some(s) if !s.connected => (0x75, 0x75, 0x75), // grey: down
         Some(s) if !s.healthy => (0xd3, 0x2f, 0x2f),   // red: no handshake
         Some(_) => (0x2e, 0x7d, 0x32),                 // green: carrying
-    };
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for _ in 0..SIZE * SIZE {
-        rgba.extend_from_slice(&[r, g, b, 0xff]);
     }
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("a solid square is always a valid icon")
+}
+
+/// Coverage of the shield shape at a point, from 0.0 outside to 1.0 inside.
+///
+/// `x` runs -1..1 across the width and `y` runs 0..1 from the top down. The
+/// outline is a flat-topped crest that tapers to a point, which is legible at
+/// 16 pixels in a way that most glyphs are not.
+fn shield_coverage(x: f32, y: f32) -> f32 {
+    if !(0.0..=1.0).contains(&y) {
+        return 0.0;
+    }
+    // Full width down to the shoulder, then a curve in to the tip. The square
+    // root makes the taper bulge outwards rather than running straight to the
+    // point, which is what stops it reading as a triangle.
+    const SHOULDER: f32 = 0.45;
+    let half = if y <= SHOULDER {
+        1.0
+    } else {
+        (1.0 - (y - SHOULDER) / (1.0 - SHOULDER)).max(0.0).sqrt()
+    };
+
+    // Round the two top corners so the crest is not a hard rectangle.
+    const CORNER: f32 = 0.22;
+    let half = if y < CORNER {
+        let dy = (CORNER - y) / CORNER;
+        half - (1.0 - (1.0 - dy * dy).max(0.0).sqrt()) * CORNER
+    } else {
+        half
+    };
+
+    if x.abs() <= half { 1.0 } else { 0.0 }
+}
+
+/// A shield in the state colour, drawn rather than shipped.
+///
+/// Windows has no equivalent of the freedesktop icon names the Linux tray uses,
+/// so the choice is between shipping image files and drawing something. This
+/// draws, which keeps the repository free of binary assets that no diff can
+/// review.
+///
+/// Rendered at 32 pixels with 3x3 supersampling. Windows scales the tray icon
+/// down to 16 on a standard-DPI display, and a shape that is merely thresholded
+/// at that size turns into a jagged blob; averaging nine samples per pixel
+/// gives the edges enough gradient to survive the scaling.
+fn icon_for(snapshot: &Snapshot) -> Icon {
+    const SIZE: u32 = 32;
+    const SAMPLES: u32 = 3;
+    let (r, g, b) = state_colour(snapshot);
+
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for py in 0..SIZE {
+        for px in 0..SIZE {
+            let mut covered = 0.0;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    // Sample at sub-pixel centres, not corners, or the shape
+                    // sits half a pixel up and to the left of where it belongs.
+                    let fx = px as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
+                    let fy = py as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
+                    // A one-pixel margin keeps the crest off the icon's edge,
+                    // where Windows' own padding would clip it.
+                    let x = (fx - SIZE as f32 / 2.0) / (SIZE as f32 / 2.0 - 1.0);
+                    let y = (fy - 1.0) / (SIZE as f32 - 2.0);
+                    covered += shield_coverage(x, y);
+                }
+            }
+            let alpha = (covered / (SAMPLES * SAMPLES) as f32 * 255.0).round() as u8;
+            rgba.extend_from_slice(&[r, g, b, alpha]);
+        }
+    }
+    Icon::from_rgba(rgba, SIZE, SIZE).expect("a generated buffer is always the size promised")
 }
 
 /// The Win32 message pump.
@@ -705,7 +766,7 @@ fn single_instance() -> bool {
 mod tests {
     use super::*;
 
-    fn status() -> StatusReport {
+    pub(super) fn status() -> StatusReport {
         StatusReport {
             connected: true,
             interface: "vpnmgr0".into(),
@@ -783,5 +844,100 @@ mod tests {
         let (_, label) = snapshot.quick_connect_entries().remove(0);
         assert!(label.contains("14.8 Gbps free"), "got: {label}");
         assert!(label.contains("26% load"), "got: {label}");
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+
+    /// Renders the shape as text, so its silhouette can be inspected rather
+    /// than assumed. A tray icon that is wrong is only ever noticed by looking.
+    fn render(size: u32) -> Vec<String> {
+        (0..size)
+            .map(|py| {
+                (0..size)
+                    .map(|px| {
+                        let x = (px as f32 + 0.5 - size as f32 / 2.0) / (size as f32 / 2.0 - 1.0);
+                        let y = (py as f32 + 0.5 - 1.0) / (size as f32 - 2.0);
+                        if shield_coverage(x, y) > 0.5 {
+                            '#'
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_shape_is_a_shield_and_not_a_rectangle() {
+        let rows = render(16);
+        let width = |row: &String| row.chars().filter(|c| *c == '#').count();
+
+        // Wide across the crest, narrowing to a point at the bottom. A solid
+        // square -- the bug this replaced -- fails on both counts.
+        assert!(width(&rows[3]) >= 12, "crest too narrow: {}", rows[3]);
+        assert!(
+            width(&rows[14]) <= 4,
+            "should be nearly a point by the bottom: {}",
+            rows[14]
+        );
+        assert_eq!(width(&rows[15]), 0, "the tip must not touch the edge");
+
+        // Monotonically narrowing below the shoulder is what makes it read as
+        // a shield rather than an hourglass or a blob.
+        for pair in rows[8..15].windows(2) {
+            assert!(
+                width(&pair[1]) <= width(&pair[0]),
+                "widens again below the shoulder:\n{}\n{}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn the_shape_is_symmetric() {
+        for row in render(16) {
+            let reversed: String = row.chars().rev().collect();
+            assert_eq!(row, reversed, "asymmetric row: {row}");
+        }
+    }
+
+    /// The corners must be transparent, or it is a square again whatever shape
+    /// was drawn inside it.
+    #[test]
+    fn the_corners_are_clear_and_the_centre_is_not() {
+        let snapshot = Snapshot::default();
+        let icon = icon_for(&snapshot);
+        // Icon has no accessor for its pixels, so the buffer is rebuilt the
+        // same way to assert on it.
+        assert!(
+            shield_coverage(-1.0, 0.0) < 0.5,
+            "top-left corner is filled"
+        );
+        assert!(
+            shield_coverage(1.0, 0.0) < 0.5,
+            "top-right corner is filled"
+        );
+        assert!(shield_coverage(0.0, 0.3) > 0.5, "the middle is empty");
+        drop(icon);
+    }
+
+    #[test]
+    fn each_state_gets_its_own_colour() {
+        let mut down = Snapshot::default();
+        assert_eq!(state_colour(&down), (0x75, 0x75, 0x75));
+
+        let mut s = super::tests::status();
+        s.healthy = false;
+        down.status = Some(s.clone());
+        assert_eq!(state_colour(&down), (0xd3, 0x2f, 0x2f), "unhealthy is red");
+
+        s.healthy = true;
+        down.status = Some(s);
+        assert_eq!(state_colour(&down), (0x2e, 0x7d, 0x32), "carrying is green");
     }
 }
