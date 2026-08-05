@@ -263,7 +263,7 @@ fn build_menu(snapshot: &Snapshot) -> (Menu, MenuMap) {
         ));
         let _ = menu.append(&quick);
 
-        let measured = MenuItem::new("Connect, measuring speed first", reachable, None);
+        let measured = MenuItem::new("Measure and connect", reachable, None);
         entries.push((
             measured.id().clone(),
             Action::Connect {

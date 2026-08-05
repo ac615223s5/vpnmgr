@@ -381,7 +381,7 @@ impl Tray for VpnTray {
             );
             items.push(
                 StandardItem {
-                    label: "Connect, measuring speed first".into(),
+                    label: "Measure and connect".into(),
                     icon_name: "speedometer".into(),
                     enabled: reachable && idle,
                     activate: Box::new(|this: &mut Self| {
