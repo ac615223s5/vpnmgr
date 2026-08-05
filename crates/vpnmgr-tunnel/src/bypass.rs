@@ -100,6 +100,10 @@ impl Route {
 
     /// The destination as a prefix. A bare address from a resolved host has no
     /// length, and every tool that takes a route wants one.
+    ///
+    /// Only `netsh` insists; `ip` accepts a bare address and infers the length,
+    /// so nothing on Linux calls this.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn prefix(&self) -> String {
         if self.destination.contains('/') {
             self.destination.clone()

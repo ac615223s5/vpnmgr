@@ -195,8 +195,27 @@ A service runs in Session 0 and has no desktop, so it cannot raise a notificatio
 `notify::desktop` is therefore a no-op on Windows and the **tray** is what surfaces a pending
 switch — it already polls.
 
-Still missing on Windows: the bypass list and the kill switch. `State::killswitch` returns
-`Error::Unsupported` rather than accepting the request and protecting nothing.
+The bypass and kill switch both exist on Windows, with the same API and different mechanics.
+
+The bypass shares its planning with Linux — which ranges, which the tunnel occupies, which
+other VPNs to mirror — and swaps only the commands: `netsh`/`Get-NetRoute` for `ip`. There is
+no `suppress_prefixlength`; Windows simply takes the longest prefix, so a specific route beats
+the tunnel's default for the same reason.
+
+Two Windows-only hazards, both of which produced a working routing table and dead traffic:
+
+- WireGuard for Windows enables **its own** WFP kill switch whenever a peer's `AllowedIPs` is
+  exactly a default route, and those filters ignore the routing table. `split_default_routes`
+  in `windows.rs` expresses the same coverage as `0.0.0.0/1` + `128.0.0.0/1` so they are not
+  installed, but only when there is something to bypass.
+- Windows Firewall evaluates **Block before Allow**, so our kill switch cannot be a blocking
+  rule with exceptions. It sets the profile's default outbound action to Block and adds Allow
+  rules, which is machine-wide state — hence the previous value is saved to disk, not memory.
+
+`route print` is never parsed: it is localised, and its headings change with system language.
+
+Reading the daemon's log on Windows means `--log-file`; a service has no console, so without
+it every diagnostic goes to a handle nobody holds.
 
 ### Building on Windows
 

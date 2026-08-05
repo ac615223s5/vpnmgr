@@ -126,14 +126,29 @@ jobs:
 
           Keeps your config and keys. \`--check\` reports without installing.
 
+          ## Windows
+
+          Download the \`x86_64-pc-windows-msvc.zip\` below, unpack it, then from
+          an **elevated** PowerShell in that folder:
+
+          \`\`\`powershell
+          winget install WireGuard.WireGuard
+          powershell -ExecutionPolicy Bypass -File .\\install.ps1 -Conf path\\to\\AirVPN.conf
+          \`\`\`
+
+          Installs to \`C:\\Program Files\\vpnmgr\`, registers the daemon as a
+          service, and adds **VPN Manager** to the Start Menu and to startup.
+
           ## Verify
 
           \`\`\`
           ${{ steps.package.outputs.sha }}  ${{ steps.package.outputs.stem }}.tar.gz
           \`\`\`
 
-          Linux x86_64, glibc 2.35 or newer. Requires the \`wireguard\` kernel
-          module and systemd.
+          Linux x86_64 needs glibc 2.35 or newer, the \`wireguard\` kernel module
+          and systemd. Windows 10/11 needs WireGuard for Windows installed; the
+          Windows archive is uploaded by a second job a few minutes after this
+          release appears.
           EOF
 
       - name: Publish
@@ -154,3 +169,70 @@ jobs:
               "dist/${{ steps.package.outputs.stem }}.tar.gz" \
               "dist/${{ steps.package.outputs.stem }}.tar.gz.sha256"
           fi
+
+  # Runs after the Linux job, which is what creates the release; this only ever
+  # uploads to a tag that already exists.
+  windows:
+    needs: release
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve the tag
+        id: tag
+        shell: bash
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+
+      # The same gates as the Linux job. The two targets compile different code
+      # -- whole modules are behind cfg -- so passing on one says nothing about
+      # the other, which is the entire reason this job exists.
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Lint
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stem="vpnmgr-${{ steps.tag.outputs.tag }}-x86_64-pc-windows-msvc"
+          mkdir -p "dist/$stem/bin" "dist/$stem/packaging"
+          cp target/release/vpnmgrd.exe target/release/vpnmgr.exe \
+             target/release/vpnmgr-tray.exe "dist/$stem/bin/"
+          cp packaging/install.ps1 "dist/$stem/install.ps1"
+          cp LICENSE README.md "dist/$stem/"
+          # Zip, not tar.gz: Explorer opens one of those without extra software.
+          powershell -NoProfile -Command \
+            "Compress-Archive -Path 'dist/$stem' -DestinationPath 'dist/$stem.zip'"
+          ( cd dist && sha256sum "$stem.zip" > "$stem.zip.sha256" )
+          echo "stem=$stem" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test the package
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="dist/${{ steps.package.outputs.stem }}"
+          "$dir/bin/vpnmgr.exe" --version
+          "$dir/bin/vpnmgrd.exe" --version
+          test -f "$dir/install.ps1"
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" --clobber \
+            "dist/${{ steps.package.outputs.stem }}.zip" \
+            "dist/${{ steps.package.outputs.stem }}.zip.sha256"

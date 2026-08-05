@@ -66,7 +66,7 @@ mod imp {
     }
 
     #[tokio::main]
-    async fn main() {
+    pub async fn main() {
         let mut args = std::env::args().skip(1);
         let conf = args
             .next()

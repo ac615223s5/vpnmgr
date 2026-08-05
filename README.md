@@ -65,8 +65,10 @@ Two servers at 27% and 62% load can have 14.4 Gbps and 756 Mbps of room.
 Windows 10/11 is supported too, with [WireGuard for
 Windows](https://www.wireguard.com/install/) installed — the daemon drives its
 tunnel service rather than shipping a driver of its own. The bypass list and
-kill switch are Linux-only so far; on Windows `vpnmgr killswitch on` reports
-that plainly instead of pretending.
+kill switch work there as well, though the firewalls are different enough that
+the kill switch has to change the profile's default outbound action rather than
+add a blocking rule: Windows Firewall puts Block above Allow, so exceptions
+cannot be carved out of a block rule.
 
 ### On Windows
 

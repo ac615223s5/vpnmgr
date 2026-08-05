@@ -40,7 +40,7 @@ mod imp {
         ok
     }
 
-    fn main() {
+    pub fn main() {
         let client = ClientConfig {
             private_key: SecretKey::from_base64("SPrivateKeyFixturexxxxxxxxxxxxxxxxxxxxxxxxA=")
                 .unwrap(),
