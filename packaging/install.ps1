@@ -132,6 +132,21 @@ $link.WorkingDirectory = $Prefix
 $link.Description = 'Keep this machine on a fast AirVPN WireGuard server'
 $link.Save()
 
+# The daemon starts at boot on its own, but nothing would then be watching for
+# a pending switch: it runs in Session 0 and cannot raise a notification, so the
+# tray is the only thing that can ask. A tray that has to be launched by hand
+# after every reboot is a tray that stops getting launched.
+#
+# The Startup folder rather than the Run registry key: it is visible in Task
+# Manager's Startup tab and removable from there, which a registry entry is not.
+Write-Host "==> starting the tray at login"
+$startup = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
+$autostart = $shell.CreateShortcut("$startup\VPN Manager Tray.lnk")
+$autostart.TargetPath = "$Prefix\vpnmgr-tray.exe"
+$autostart.WorkingDirectory = $Prefix
+$autostart.Description = 'VPN Manager tray icon'
+$autostart.Save()
+
 Write-Host ""
 Write-Host "Done. 'VPN Manager' is in the Start Menu; it opens the tray icon."
 Write-Host "Launching it while it is already running does nothing rather than"

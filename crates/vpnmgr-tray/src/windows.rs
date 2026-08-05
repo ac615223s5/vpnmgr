@@ -4,7 +4,13 @@
 //!
 //! A Win32 tray icon is owned by a window, and menu clicks arrive as window
 //! messages. Something has to pump them, and it must be the thread that created
-//! the icon. `winit` supplies that loop without dragging in a GUI toolkit.
+//! the icon.
+//!
+//! That pump is fifteen lines of `PeekMessage`/`DispatchMessage` here rather
+//! than a windowing library. The obvious choice, winit, creates a real
+//! top-level window whether or not one is asked for, and a tray program that
+//! opens an empty window every time it starts is worse than one that writes its
+//! own loop.
 //!
 //! The daemon protocol is async, so the network side lives on a tokio runtime
 //! on another thread and the two talk through channels. That split is not
@@ -19,15 +25,13 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Parser;
 use tokio::sync::mpsc;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIconBuilder};
 use vpnmgr_ipc::{DEFAULT_SOCKET, RankedServer, Request, Response, ServerSummary, StatusReport};
-use winit::application::ApplicationHandler;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 
 use crate::format::{human_bytes, measured_ago, rate, truncate};
 
@@ -79,6 +83,21 @@ impl Snapshot {
         self.status.as_ref().is_some_and(|s| s.connected)
     }
 
+    /// The measured no-VPN line rate, as a menu line.
+    ///
+    /// Worth its own line because it is the yardstick: "is this server fast
+    /// enough" is decided as a fraction of this number, so a user looking at a
+    /// server's measured speed has no way to judge it without knowing what the
+    /// line itself does. Absent until something has measured it.
+    fn baseline_line(&self) -> Option<String> {
+        let s = self.status.as_ref()?;
+        let mbps = s.baseline_mbps?;
+        Some(match s.baseline_age_secs {
+            Some(age) => format!("without VPN: {} ({})", rate(mbps), measured_ago(age)),
+            None => format!("without VPN: {}", rate(mbps)),
+        })
+    }
+
     fn headline(&self) -> String {
         match &self.status {
             None => "vpnmgrd is not reachable".to_owned(),
@@ -105,6 +124,12 @@ impl Snapshot {
                 out.push_str(&format!("\nhandshake {age}s ago"));
             }
         }
+        if let Some(baseline) = self.baseline_line() {
+            out.push_str(&format!(
+                "
+{baseline}"
+            ));
+        }
         if let Some(busy) = &self.busy {
             out.push_str(&format!("\n{busy}…"));
         }
@@ -126,7 +151,7 @@ impl Snapshot {
                     (
                         s.name.clone(),
                         format!(
-                            "{} — {} ({:.0}ms{}, {}% load)",
+                            "{} — {} ({:.0}ms{}, {}% load, {} free)",
                             s.name,
                             truncate(&s.location, 22),
                             s.rtt_ms,
@@ -135,7 +160,8 @@ impl Snapshot {
                                     format!(", {} {}", rate(mbps), measured_ago(age)),
                                 _ => String::new(),
                             },
-                            s.load
+                            s.load,
+                            rate(s.headroom_mbps as f64),
                         ),
                     )
                 })
@@ -148,10 +174,11 @@ impl Snapshot {
                 (
                     s.name.clone(),
                     format!(
-                        "{} — {} ({}% load)",
+                        "{} — {} ({}% load, {} free)",
                         s.name,
                         truncate(&s.location, 24),
-                        s.load
+                        s.load,
+                        rate(s.headroom_mbps as f64),
                     ),
                 )
             })
@@ -187,6 +214,10 @@ fn build_menu(snapshot: &Snapshot) -> (Menu, MenuMap) {
 
     if let Some(busy) = &snapshot.busy {
         let _ = menu.append(&MenuItem::new(format!("{busy}…"), false, None));
+    }
+
+    if let Some(baseline) = snapshot.baseline_line() {
+        let _ = menu.append(&MenuItem::new(baseline, false, None));
     }
 
     // A proposal is the one thing the tray exists to surface, so it goes above
@@ -292,119 +323,45 @@ fn icon_for(snapshot: &Snapshot) -> Icon {
     Icon::from_rgba(rgba, SIZE, SIZE).expect("a solid square is always a valid icon")
 }
 
-/// State the event loop owns.
-struct App {
-    tray: Option<TrayIcon>,
-    map: MenuMap,
-    snapshot: Snapshot,
-    actions: mpsc::UnboundedSender<Action>,
-    updates: std_mpsc::Receiver<Snapshot>,
-    /// Whether a proposal was already on screen, so the balloon fires on the
-    /// transition rather than every ten seconds for as long as it stands.
-    announced_pending: bool,
-    next_poll: Instant,
-}
+/// The Win32 message pump.
+///
+/// `PeekMessage` rather than `GetMessage`: the loop also has to drain menu
+/// clicks and daemon updates from channels, and `GetMessage` blocks until a
+/// window message arrives, which may be never on an idle desktop.
+fn pump_messages() {
+    const PM_REMOVE: u32 = 0x0001;
 
-impl App {
-    fn apply(&mut self, snapshot: Snapshot) {
-        let pending = snapshot
-            .status
-            .as_ref()
-            .is_some_and(|s| s.pending_switch.is_some());
-        if pending && !self.announced_pending {
-            let name = snapshot
-                .status
-                .as_ref()
-                .and_then(|s| s.pending_switch.as_ref())
-                .map(|p| p.to.name.clone())
-                .unwrap_or_default();
-            self.notify(
-                "A faster VPN server is available",
-                &format!("Switch to {name}?"),
-            );
-        }
-        self.announced_pending = pending;
-
-        self.snapshot = snapshot;
-        let (menu, map) = build_menu(&self.snapshot);
-        self.map = map;
-        if let Some(tray) = &self.tray {
-            tray.set_menu(Some(Box::new(menu)));
-            let _ = tray.set_tooltip(Some(self.snapshot.tooltip()));
-            let _ = tray.set_icon(Some(icon_for(&self.snapshot)));
-        }
+    #[repr(C)]
+    struct Msg {
+        hwnd: isize,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        time: u32,
+        pt_x: i32,
+        pt_y: i32,
     }
 
-    fn notify(&self, title: &str, body: &str) {
-        // Best effort: a machine with notifications turned off is not a fault,
-        // and the state is on the icon and in the menu regardless.
-        if let Some(tray) = &self.tray {
-            let _ = tray.set_tooltip(Some(format!("{title}\n{body}")));
-        }
-        tracing::info!("{title}: {body}");
-    }
-}
-
-impl ApplicationHandler for App {
-    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
-
-    fn window_event(
-        &mut self,
-        _event_loop: &ActiveEventLoop,
-        _id: winit::window::WindowId,
-        _event: winit::event::WindowEvent,
-    ) {
+    unsafe extern "system" {
+        fn PeekMessageW(msg: *mut Msg, hwnd: isize, min: u32, max: u32, remove: u32) -> i32;
+        fn TranslateMessage(msg: *const Msg) -> i32;
+        fn DispatchMessageW(msg: *const Msg) -> isize;
     }
 
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
-        // The tray icon must be created after the event loop exists, or it has
-        // no window to receive messages on.
-        if self.tray.is_none() {
-            let (menu, map) = build_menu(&self.snapshot);
-            self.map = map;
-            match TrayIconBuilder::new()
-                .with_menu(Box::new(menu))
-                .with_tooltip(self.snapshot.tooltip())
-                .with_icon(icon_for(&self.snapshot))
-                .build()
-            {
-                Ok(tray) => self.tray = Some(tray),
-                Err(e) => {
-                    tracing::error!("could not create the tray icon: {e}");
-                    event_loop.exit();
-                    return;
-                }
-            }
+    // SAFETY: `msg` is a correctly-shaped, writable MSG for the duration of
+    // each call, and only messages for this thread are requested.
+    unsafe {
+        let mut msg = std::mem::zeroed::<Msg>();
+        while PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
-
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            let Some(action) = self.map.action_for(&event.id) else {
-                continue;
-            };
-            if matches!(action, Action::Quit) {
-                event_loop.exit();
-                return;
-            }
-            if self.actions.send(action).is_err() {
-                event_loop.exit();
-                return;
-            }
-        }
-
-        while let Ok(snapshot) = self.updates.try_recv() {
-            self.apply(snapshot);
-        }
-
-        // Wake often enough to stay responsive to menu clicks, which arrive
-        // through a channel rather than as window messages we would be woken
-        // for.
-        let next = Instant::now() + Duration::from_millis(200);
-        self.next_poll = next;
-        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 }
 
 pub fn main() {
+    attach_parent_console();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -433,21 +390,59 @@ pub fn main() {
         runtime.block_on(daemon_loop(socket, action_rx, update_tx));
     });
 
-    let event_loop = EventLoop::new().expect("create the event loop");
-    event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App {
-        tray: None,
-        map: MenuMap {
-            entries: Vec::new(),
-        },
-        snapshot: Snapshot::default(),
-        actions: action_tx,
-        updates: update_rx,
-        announced_pending: false,
-        next_poll: Instant::now(),
+    // The icon must be created on the thread that pumps its messages.
+    let (menu, mut map) = build_menu(&Snapshot::default());
+    let tray = match TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("vpnmgrd is not reachable")
+        .with_icon(icon_for(&Snapshot::default()))
+        .build()
+    {
+        Ok(tray) => tray,
+        Err(e) => {
+            tracing::error!("could not create the tray icon: {e}");
+            return;
+        }
     };
-    if let Err(e) = event_loop.run_app(&mut app) {
-        tracing::error!("event loop stopped: {e}");
+
+    let mut announced_pending = false;
+
+    loop {
+        pump_messages();
+
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            let Some(action) = map.action_for(&event.id) else {
+                continue;
+            };
+            if matches!(action, Action::Quit) {
+                return;
+            }
+            if action_tx.send(action).is_err() {
+                return;
+            }
+        }
+
+        while let Ok(snapshot) = update_rx.try_recv() {
+            // Fire on the transition, not for as long as the proposal stands,
+            // or this would repeat every ten seconds until it was answered.
+            let pending = snapshot
+                .status
+                .as_ref()
+                .is_some_and(|s| s.pending_switch.is_some());
+            if pending && !announced_pending {
+                tracing::info!("a faster server is available; see the tray menu");
+            }
+            announced_pending = pending;
+
+            let (menu, rebuilt) = build_menu(&snapshot);
+            map = rebuilt;
+            tray.set_menu(Some(Box::new(menu)));
+            let _ = tray.set_tooltip(Some(snapshot.tooltip()));
+            let _ = tray.set_icon(Some(icon_for(&snapshot)));
+        }
+
+        // Long enough to stay idle, short enough that a click feels immediate.
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -544,6 +539,27 @@ async fn refresh(socket: &PathBuf, busy: Option<String>) -> Snapshot {
     snapshot
 }
 
+/// Reattach to the terminal that launched us, when there is one.
+///
+/// A windows-subsystem program is given no console, which is the point -- it is
+/// why launching from the Start Menu no longer leaves an empty terminal behind.
+/// But it also means `--help` and `--version` would print nowhere at all. If a
+/// terminal did start us, borrowing its console puts that output back where the
+/// person who typed the command is looking.
+fn attach_parent_console() {
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    // SAFETY: no arguments to get wrong, and a failure -- which is the normal
+    // case, since the Start Menu is not a terminal -- only means there was no
+    // console to attach to.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 /// Refuse to start a second tray.
 ///
 /// A named mutex rather than a lock file: Windows releases it when the process
@@ -576,4 +592,88 @@ fn single_instance() -> bool {
         return true;
     }
     unsafe { GetLastError() != ERROR_ALREADY_EXISTS }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status() -> StatusReport {
+        StatusReport {
+            connected: true,
+            interface: "vpnmgr0".into(),
+            server: Some("Kornephoros".into()),
+            location: Some("Toronto, Ontario".into()),
+            country_code: Some("ca".into()),
+            endpoint: Some("1.2.3.4:1637".parse().unwrap()),
+            entry: Some(3),
+            last_handshake_secs: Some(12),
+            healthy: true,
+            tx_bytes: 1024,
+            rx_bytes: 2048,
+            last_sweep: None,
+            pending_switch: None,
+            last_tune: None,
+            next_tune_secs: None,
+            baseline_mbps: Some(843.2),
+            baseline_age_secs: Some(7200),
+        }
+    }
+
+    fn ranked(headroom_mbps: u64) -> RankedServer {
+        RankedServer {
+            name: "Kornephoros".into(),
+            country_code: "ca".into(),
+            country_name: "Canada".into(),
+            location: "Toronto, Ontario".into(),
+            load: 26,
+            rtt_ms: 6.9,
+            score: 0.9,
+            entry: 3,
+            endpoint: "1.2.3.4:1637".parse().unwrap(),
+            mbps: None,
+            mbps_age_secs: None,
+            headroom_mbps,
+        }
+    }
+
+    /// The yardstick every "is this fast enough" judgement is made against. A
+    /// measured server speed means nothing without it.
+    #[test]
+    fn the_measured_line_rate_is_shown_with_its_age() {
+        let snapshot = Snapshot {
+            status: Some(status()),
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot.baseline_line().as_deref(),
+            Some("without VPN: 843 Mbps (2h ago)")
+        );
+    }
+
+    /// Nothing has measured it yet is a different thing from zero.
+    #[test]
+    fn no_line_rate_means_no_line() {
+        let mut s = status();
+        s.baseline_mbps = None;
+        let snapshot = Snapshot {
+            status: Some(s),
+            ..Default::default()
+        };
+        assert_eq!(snapshot.baseline_line(), None);
+    }
+
+    /// Headroom is what distinguishes two servers at the same load, so it
+    /// belongs on the line the user picks from.
+    #[test]
+    fn server_entries_carry_their_spare_capacity() {
+        let snapshot = Snapshot {
+            status: Some(status()),
+            ranking: vec![ranked(14_800)],
+            ..Default::default()
+        };
+        let (_, label) = snapshot.quick_connect_entries().remove(0);
+        assert!(label.contains("14.8 Gbps free"), "got: {label}");
+        assert!(label.contains("26% load"), "got: {label}");
+    }
 }

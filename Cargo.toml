@@ -41,10 +41,9 @@ libc = "0.2"
 # StatusNotifierItem tray. Works under Cinnamon via xapp-sn-watcher, and
 # under KDE/GNOME-with-AppIndicator, without linking any GUI toolkit.
 ksni = "0.3"
-# Windows tray. `tray-icon` needs a running event loop to receive menu clicks,
-# and winit supplies one without pulling in a GUI toolkit.
+# Windows tray. Its message pump is a dozen lines of PeekMessage in
+# vpnmgr-tray, rather than a windowing library that would open a real window.
 tray-icon = "0.21"
-winit = "0.30"
 # Windows service plumbing: the SCM dispatcher and control handler that
 # systemd provides for free on Linux.
 windows-service = "0.8"
