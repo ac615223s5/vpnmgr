@@ -32,6 +32,11 @@ use vpnmgr_core::ClientConfig;
 pub mod bypass;
 #[cfg(target_os = "linux")]
 pub mod killswitch;
+// Same API, different firewall: Windows Firewall puts Block above Allow, so
+// exceptions have to come from the default action rather than from ordering.
+#[cfg(target_os = "windows")]
+#[path = "killswitch_windows.rs"]
+pub mod killswitch;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
@@ -39,7 +44,6 @@ pub mod linux;
 pub mod windows;
 
 pub use bypass::Bypass;
-#[cfg(target_os = "linux")]
 pub use killswitch::Killswitch;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxTunnel;

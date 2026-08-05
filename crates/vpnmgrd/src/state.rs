@@ -13,9 +13,7 @@ use vpnmgr_ipc::{
     StatusReport, SweepSummary, TuneReport,
 };
 use vpnmgr_probe::{Prober, sweep};
-#[cfg(target_os = "linux")]
-use vpnmgr_tunnel::Killswitch;
-use vpnmgr_tunnel::{DEFAULT_FWMARK, PlatformTunnel, TunnelBackend, TunnelSpec};
+use vpnmgr_tunnel::{DEFAULT_FWMARK, Killswitch, PlatformTunnel, TunnelBackend, TunnelSpec};
 
 use crate::tuner::{self, Assessment, Decision};
 
@@ -136,8 +134,6 @@ pub enum Error {
          kill switch, so it needs explicit confirmation: pass --yes"
     )]
     ConsentRequired,
-    #[error("{feature} is not implemented on this platform")]
-    Unsupported { feature: &'static str },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -798,7 +794,6 @@ impl State {
             tunnel = tunnel.with_bypass(plan);
         }
 
-        #[cfg(target_os = "linux")]
         if self.config.killswitch.enabled {
             tunnel = tunnel.with_killswitch(Killswitch::new(
                 vpnmgr_tunnel::DEFAULT_INTERFACE,
@@ -952,26 +947,6 @@ impl State {
     }
 
     /// Turn the kill switch on or off at runtime, or just report on it.
-    ///
-    /// Windows has no implementation yet, and says so rather than accepting the
-    /// request and quietly protecting nothing — a kill switch believed to be on
-    /// but absent is worse than one known to be missing.
-    #[cfg(not(target_os = "linux"))]
-    pub fn killswitch(&mut self, enable: Option<bool>) -> Result<KillswitchReport> {
-        if enable.is_some() {
-            return Err(Error::Unsupported {
-                feature: "the kill switch",
-            });
-        }
-        Ok(KillswitchReport {
-            engaged: false,
-            configured: self.config.killswitch.enabled,
-            dropped: None,
-        })
-    }
-
-    /// Turn the kill switch on or off at runtime, or just report on it.
-    #[cfg(target_os = "linux")]
     pub fn killswitch(&mut self, enable: Option<bool>) -> Result<KillswitchReport> {
         match enable {
             Some(true) => {

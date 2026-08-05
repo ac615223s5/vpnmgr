@@ -46,6 +46,7 @@ use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::bypass::{Bypass, Route};
+use crate::killswitch::Killswitch;
 use crate::{Error, Result, TunnelBackend, TunnelSpec, TunnelStatus};
 
 /// Stops a console window flashing up for every `wg show`. The tray polls
@@ -85,6 +86,8 @@ pub struct WindowsTunnel {
     /// them once the tunnel is up.
     bypass_plan: Vec<Route>,
     bypass: Bypass,
+    /// Engaged after the tunnel is up and released when it comes down.
+    killswitch: Option<Killswitch>,
 }
 
 impl WindowsTunnel {
@@ -109,12 +112,19 @@ impl WindowsTunnel {
             installed: false,
             bypass_plan: Vec::new(),
             bypass: Bypass::new(),
+            killswitch: None,
         })
     }
 
     /// Destinations that must not travel through the tunnel.
     pub fn with_bypass(mut self, plan: Vec<Route>) -> Self {
         self.bypass_plan = plan;
+        self
+    }
+
+    /// Block traffic that is not leaving through the tunnel.
+    pub fn with_killswitch(mut self, killswitch: Killswitch) -> Self {
+        self.killswitch = Some(killswitch);
         self
     }
 
@@ -223,6 +233,15 @@ impl TunnelBackend for WindowsTunnel {
         )
         .map_err(|e| self.classify("installing the tunnel service", e))?;
 
+        if let Some(killswitch) = self.killswitch.take() {
+            // After the adapter exists, so the rule naming it can be created,
+            // and carrying the bypass destinations so the firewall permits
+            // exactly what the routing table just diverted.
+            let killswitch = killswitch.allowing(self.bypass.destinations());
+            killswitch.engage()?;
+            self.killswitch = Some(killswitch);
+        }
+
         self.installed = true;
         tracing::info!(
             interface = %self.interface,
@@ -281,6 +300,9 @@ impl TunnelBackend for WindowsTunnel {
 
     fn down(&mut self) -> Result<()> {
         self.remove_service()?;
+        if self.killswitch.is_some() {
+            Killswitch::release()?;
+        }
         self.bypass.remove();
         // The key material has no reason to outlive the tunnel.
         if let Err(e) = std::fs::remove_file(&self.conf_path)
