@@ -564,7 +564,7 @@ async fn refresh(socket: &PathBuf, busy: Option<String>) -> Snapshot {
     snapshot
 }
 
-/// Open the configuration in Notepad, elevated, and wait for it to close.
+/// Open the configuration in the user's editor, elevated, and wait for it.
 ///
 /// Elevated because the file has to be: it lives beside the WireGuard key
 /// files in a directory stripped down to SYSTEM and Administrators, so an
@@ -577,12 +577,63 @@ async fn refresh(socket: &PathBuf, busy: Option<String>) -> Snapshot {
 /// to reload only once the editor has exited, so a half-saved file is never
 /// what gets loaded.
 fn edit_config(path: &str) {
-    let launch = format!(
-        "Start-Process -FilePath notepad.exe -Verb RunAs -Wait -ArgumentList '{}'",
-        path.replace('\'', "''")
-    );
+    // Resolve the handler the user has actually chosen for this file type, in
+    // the order Windows resolves it itself: the per-user UserChoice that an
+    // "Open with" selection writes, then the machine-wide association. Only the
+    // executable is taken from the registered command -- the rest of that
+    // string is a template full of %1 and /dde that varies by handler, and
+    // substituting into it correctly is not worth the failure modes.
+    //
+    // A .toml with no association at all is common, so the .txt handler is
+    // tried next -- a config file is a text file, and that is the editor the
+    // user actually chose. Notepad is the last resort, being the only one
+    // guaranteed to exist.
+    const RESOLVE_AND_LAUNCH: &str = r#"
+$path = 'PATH_PLACEHOLDER'
+$ext = [IO.Path]::GetExtension($path)
+$progId = $null
+try {
+  $key = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext\UserChoice"
+  $progId = (Get-ItemProperty $key -ErrorAction Stop).ProgId
+} catch {}
+if (-not $progId) {
+  try { $progId = (Get-Item "Registry::HKEY_CLASSES_ROOT\$ext" -ErrorAction Stop).GetValue('') } catch {}
+}
+# .toml is very often associated with nothing at all, and a config file is a
+# text file, so the editor chosen for .txt is a far better answer than the
+# fallback below -- it is what "my default text editor" means to the person
+# who set it.
+if (-not $progId) {
+  try {
+    $key = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.txt\UserChoice"
+    $progId = (Get-ItemProperty $key -ErrorAction Stop).ProgId
+  } catch {}
+}
+if (-not $progId) {
+  try { $progId = (Get-Item "Registry::HKEY_CLASSES_ROOT\.txt" -ErrorAction Stop).GetValue('') } catch {}
+}
+$cmd = $null
+if ($progId) {
+  try {
+    $cmd = (Get-Item "Registry::HKEY_CLASSES_ROOT\$progId\shell\open\command" -ErrorAction Stop).GetValue('')
+  } catch {}
+}
+$exe = 'notepad.exe'
+if ($cmd) {
+  $expanded = [Environment]::ExpandEnvironmentVariables($cmd)
+  if ($expanded -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
+  elseif ($expanded -match '^\s*(\S+)') { $exe = $Matches[1] }
+}
+# A handler that is not a plain executable -- a shell verb routed through
+# rundll32, say -- would be launched with arguments it cannot understand.
+if (-not ($exe -like '*.exe')) { $exe = 'notepad.exe' }
+Start-Process -FilePath $exe -Verb RunAs -Wait -ArgumentList $path
+"#;
+
+    let script = RESOLVE_AND_LAUNCH.replace("PATH_PLACEHOLDER", &path.replace('\'', "''"));
+
     match std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &launch])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .status()
     {
         // A declined UAC prompt lands here, and is a decision rather than a
