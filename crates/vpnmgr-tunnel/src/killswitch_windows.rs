@@ -143,9 +143,18 @@ impl Killswitch {
         };
 
         // The tunnel adapter: everything that reaches it is already encrypted.
-        s.push_str(&rule(
-            "tunnel",
-            &format!("-InterfaceAlias '{}'", self.interface),
+        //
+        // Guarded, because engaging while disconnected is a legitimate thing to
+        // want -- "let nothing out until I am on the VPN" -- and naming an
+        // adapter that does not exist is a hard error that would abort the rest
+        // of the ruleset. When the tunnel does come up the kill switch is
+        // engaged again with the adapter present, so the rule appears then.
+        s.push_str(&format!(
+            "if (Get-NetAdapter -Name '{iface}' -ErrorAction SilentlyContinue) {{
+  {rule}}}
+",
+            iface = self.interface,
+            rule = rule("tunnel", &format!("-InterfaceAlias '{}'", self.interface)),
         ));
 
         // The encrypted traffic itself, and the prober's handshakes.
@@ -185,10 +194,23 @@ impl Killswitch {
     }
 
     pub fn engage(&self) -> Result<()> {
-        run(&self.script()).map_err(|source| Error::Killswitch {
-            operation: "engaging",
-            source,
-        })?;
+        if let Err(source) = run(&self.script()) {
+            // The script clears the old rules before writing the new ones, so a
+            // failure part-way through can leave the default action still set to
+            // Block with nothing allowed past it -- every destination blocked,
+            // including the LAN and the tunnel itself. Failing closed is right
+            // when the tunnel is up and wrong here, because this state protects
+            // nothing that is not already protected and only takes the machine
+            // off the network. Undo it and report.
+            tracing::error!("engaging the kill switch failed, rolling back: {source}");
+            if let Err(e) = Self::release() {
+                tracing::error!("rollback also failed: {e}. {}", Self::recovery_hint());
+            }
+            return Err(Error::Killswitch {
+                operation: "engaging",
+                source,
+            });
+        }
         tracing::info!(
             interface = %self.interface,
             allow_lan = self.allow_lan,
@@ -388,6 +410,21 @@ mod tests {
         let remove = script.find("Remove-NetFirewallRule").unwrap();
         let create = script.find("New-NetFirewallRule").unwrap();
         assert!(remove < create);
+    }
+
+    /// Engaging while disconnected is a legitimate request -- let nothing out
+    /// until I am on the VPN -- and naming an adapter that does not exist yet
+    /// is a hard error that would abort every rule after it, leaving the
+    /// default action changed with nothing allowed past it.
+    #[test]
+    fn the_tunnel_rule_is_skipped_when_the_adapter_is_absent() {
+        let script = ks().script();
+        let guard = script.find("Get-NetAdapter -Name 'vpnmgr0'").unwrap();
+        let rule = script.find("-InterfaceAlias 'vpnmgr0'").unwrap();
+        assert!(
+            guard < rule,
+            "the adapter rule must be guarded by its existence"
+        );
     }
 
     #[test]

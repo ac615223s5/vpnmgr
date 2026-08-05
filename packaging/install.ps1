@@ -56,6 +56,16 @@ if ($existing -and $existing.Status -ne 'Stopped') {
     Start-Sleep -Seconds 2
 }
 
+# The tray holds its own image open just as the service does, and it is a
+# long-lived process most users leave running, so an update fails on a sharing
+# violation partway through unless it is stopped first.
+$tray = Get-Process -Name vpnmgr-tray -ErrorAction SilentlyContinue
+if ($tray) {
+    Write-Host "    stopping the running tray first"
+    $tray | Stop-Process -Force
+    Start-Sleep -Seconds 1
+}
+
 foreach ($exe in 'vpnmgrd.exe', 'vpnmgr.exe', 'vpnmgr-tray.exe') {
     Copy-Item -Force "$bin\$exe" "$Prefix\$exe"
 }
