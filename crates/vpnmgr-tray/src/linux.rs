@@ -53,6 +53,8 @@ enum Action {
     },
     Disconnect,
     Autotune,
+    /// Open the daemon's configuration in an editor, then reload it.
+    EditConfig(String),
     Approve,
     Dismiss,
     Quit,
@@ -349,6 +351,23 @@ impl Tray for VpnTray {
             .into(),
         );
 
+        // Only when the daemon has said where its config is: it can be started
+        // with --config, and guessing would edit a file nothing reads.
+        if let Some(path) = self.status.as_ref().and_then(|s| s.config_path.clone()) {
+            items.push(
+                StandardItem {
+                    label: "Edit configuration…".into(),
+                    icon_name: "document-edit".into(),
+                    enabled: idle,
+                    activate: Box::new(move |this: &mut Self| {
+                        this.dispatch(Action::EditConfig(path.clone()))
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
         if self.connected() {
             items.push(
                 StandardItem {
@@ -519,6 +538,54 @@ fn notify_user(summary: &str, body: &str) {
 }
 
 /// A non-interactive line of text in the menu.
+/// Open the configuration in an editor, elevated, and wait for it to close.
+///
+/// Elevated because the file has to be: it lives beside the WireGuard key files
+/// in a directory owned by root and readable by nobody else, so an ordinary
+/// editor cannot even open it. `pkexec` rather than `sudo`, because this is a
+/// desktop program with no terminal to type a password into.
+///
+/// Best effort by design. No editor is guaranteed to be present on every
+/// desktop, so a short list is tried in turn and a failure is reported rather
+/// than retried -- the user still has the path, and `sudoedit` in a terminal
+/// always works.
+fn edit_config(path: &str) {
+    use std::process::Command;
+
+    if Command::new("pkexec").arg("--version").output().is_err() {
+        tracing::warn!(
+            "pkexec is not installed, so the configuration cannot be opened with              the privilege it needs. Edit it with: sudoedit {path}"
+        );
+        return;
+    }
+
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+    for editor in ["xdg-open", "gedit", "kate", "mousepad", "gnome-text-editor"] {
+        // pkexec clears the environment, so a graphical editor has to be told
+        // which display to open on.
+        let status = Command::new("pkexec")
+            .args(["env", &format!("DISPLAY={display}")])
+            .arg(editor)
+            .arg(path)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                tracing::info!("configuration closed; reloading");
+                return;
+            }
+            // pkexec uses 126 for a dismissed prompt and 127 for a missing
+            // program. A dismissal is a decision: stop rather than working
+            // down the list opening editors the user did not ask for.
+            Ok(s) if s.code() == Some(126) => {
+                tracing::info!("the editor was not opened (authentication declined)");
+                return;
+            }
+            _ => continue,
+        }
+    }
+    tracing::warn!("no usable editor found; edit it with: sudoedit {path}");
+}
+
 fn disabled(label: String) -> MenuItem<VpnTray> {
     StandardItem {
         label,
@@ -655,6 +722,13 @@ async fn run_actions(
             ),
             Action::Disconnect => (Request::Disconnect, "Disconnecting"),
             Action::Autotune => (Request::Autotune, "Testing servers"),
+            // Not a daemon request: the editor runs here and the daemon is only
+            // told to re-read the file once it has been closed, so a half-saved
+            // file is never what gets loaded.
+            Action::EditConfig(path) => {
+                edit_config(path);
+                (Request::Reload, "Reloading")
+            }
             Action::Approve => (Request::Approve, "Switching"),
             Action::Dismiss => (Request::Dismiss, "Dismissing"),
             Action::Quit => unreachable!("handled above"),
@@ -840,6 +914,7 @@ mod tests {
             pending_switch: None,
             last_tune: None,
             next_tune_secs: None,
+            config_path: None,
             baseline_mbps: mbps,
             baseline_age_secs: age,
         }

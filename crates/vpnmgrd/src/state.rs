@@ -669,6 +669,7 @@ impl State {
                 pending_switch: self.pending_switch(),
                 last_tune: self.last_tune.clone(),
                 next_tune_secs: Some(self.time_until_next_tune().as_secs()),
+                config_path: Some(self.config_path.display().to_string()),
                 baseline_mbps: self.direct_mbps(),
                 baseline_age_secs: self.direct_mbps.map(|(_, at)| at.elapsed().as_secs()),
             };
@@ -704,6 +705,7 @@ impl State {
             pending_switch: self.pending_switch(),
             last_tune: self.last_tune.clone(),
             next_tune_secs: Some(self.time_until_next_tune().as_secs()),
+            config_path: Some(self.config_path.display().to_string()),
             baseline_mbps: self.direct_mbps(),
             baseline_age_secs: self.direct_mbps.map(|(_, at)| at.elapsed().as_secs()),
         }

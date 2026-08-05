@@ -178,6 +178,13 @@ pub struct StatusReport {
     pub last_tune: Option<String>,
     /// Seconds until the next scheduled tuning pass.
     pub next_tune_secs: Option<u64>,
+    /// The configuration file this daemon actually loaded.
+    ///
+    /// Reported rather than assumed by the client: the daemon can be started
+    /// with `--config`, and a tray that opened the default path would then be
+    /// editing a file nothing reads. Defaulted so an older daemon still parses.
+    #[serde(default)]
+    pub config_path: Option<String>,
     /// What this connection managed with the tunnel down, when that has been
     /// measured. Every judgement about whether a server is fast enough is made
     /// relative to this, so it is worth showing rather than leaving implicit.
@@ -480,6 +487,7 @@ mod tests {
             pending_switch: Some(sample_pending()),
             last_tune: Some("Kornephoros is healthy at 5.4ms".into()),
             next_tune_secs: Some(1500),
+            config_path: None,
             baseline_mbps: Some(843.2),
             baseline_age_secs: Some(900),
         }

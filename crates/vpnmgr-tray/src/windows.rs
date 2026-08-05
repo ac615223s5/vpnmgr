@@ -63,6 +63,8 @@ enum Action {
     },
     Disconnect,
     Autotune,
+    /// Open the daemon's configuration in an editor, then reload it.
+    EditConfig(String),
     Approve,
     Dismiss,
     Quit,
@@ -295,6 +297,14 @@ fn build_menu(snapshot: &Snapshot) -> (Menu, MenuMap) {
     entries.push((test.id().clone(), Action::Autotune));
     let _ = menu.append(&test);
 
+    // Only offered when the daemon has said where its config is; guessing the
+    // path would mean editing a file nothing reads.
+    if let Some(path) = snapshot.status.as_ref().and_then(|s| s.config_path.clone()) {
+        let edit = MenuItem::new("Edit configuration…", true, None);
+        entries.push((edit.id().clone(), Action::EditConfig(path)));
+        let _ = menu.append(&edit);
+    }
+
     let _ = menu.append(&PredefinedMenuItem::separator());
     let quit = MenuItem::new("Quit", true, None);
     entries.push((quit.id().clone(), Action::Quit));
@@ -461,10 +471,24 @@ async fn daemon_loop(
                 }
             }
             Some(action) = actions.recv() => {
+                // Not a daemon request: the editor runs here, and the daemon
+                // is only told to re-read the file once it has been closed.
+                if let Action::EditConfig(path) = &action {
+                    edit_config(path);
+                    if let Err(e) =
+                        vpnmgr_ipc::client::request(&socket, &Request::Reload).await
+                    {
+                        tracing::warn!("reloading after an edit failed: {e}");
+                    }
+                    let _ = updates.send(refresh(&socket, None).await);
+                    continue;
+                }
+
                 let busy = match &action {
                     Action::Connect { .. } => "Connecting",
                     Action::Disconnect => "Disconnecting",
                     Action::Autotune => "Testing servers",
+                    Action::EditConfig(_) => unreachable!("handled above"),
                     Action::Approve => "Switching",
                     Action::Dismiss => "Dismissing",
                     Action::Quit => return,
@@ -475,6 +499,7 @@ async fn daemon_loop(
                     Action::Connect { server, measure } => Request::Connect { server, measure },
                     Action::Disconnect => Request::Disconnect,
                     Action::Autotune => Request::Autotune,
+                    Action::EditConfig(_) => unreachable!("handled above"),
                     Action::Approve => Request::Approve,
                     Action::Dismiss => Request::Dismiss,
                     Action::Quit => return,
@@ -537,6 +562,37 @@ async fn refresh(socket: &PathBuf, busy: Option<String>) -> Snapshot {
     }
 
     snapshot
+}
+
+/// Open the configuration in Notepad, elevated, and wait for it to close.
+///
+/// Elevated because the file has to be: it lives beside the WireGuard key
+/// files in a directory stripped down to SYSTEM and Administrators, so an
+/// ordinary editor cannot even read it. The UAC prompt is not incidental
+/// friction -- it is the same permission boundary that keeps the key material
+/// out of reach, and asking here is better than showing a menu entry that
+/// silently fails.
+///
+/// Blocking on purpose: this runs on the client thread, and the daemon is told
+/// to reload only once the editor has exited, so a half-saved file is never
+/// what gets loaded.
+fn edit_config(path: &str) {
+    let launch = format!(
+        "Start-Process -FilePath notepad.exe -Verb RunAs -Wait -ArgumentList '{}'",
+        path.replace('\'', "''")
+    );
+    match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &launch])
+        .status()
+    {
+        // A declined UAC prompt lands here, and is a decision rather than a
+        // fault: the user chose not to edit anything.
+        Ok(status) if !status.success() => {
+            tracing::info!("the editor was not opened (elevation declined?)")
+        }
+        Ok(_) => tracing::info!("configuration closed; reloading"),
+        Err(e) => tracing::warn!("could not open an editor for {path}: {e}"),
+    }
 }
 
 /// Reattach to the terminal that launched us, when there is one.
@@ -615,6 +671,7 @@ mod tests {
             pending_switch: None,
             last_tune: None,
             next_tune_secs: None,
+            config_path: None,
             baseline_mbps: Some(843.2),
             baseline_age_secs: Some(7200),
         }
