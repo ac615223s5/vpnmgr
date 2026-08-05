@@ -72,10 +72,20 @@ that plainly instead of pretending.
 
 ```powershell
 winget install WireGuard.WireGuard
-# from an elevated prompt:
-vpnmgrd --install-service
-sc start vpnmgrd
+cargo build --release
+# from an elevated prompt, at the repository root:
+powershell -ExecutionPolicy Bypass -File packaging\install.ps1 -Conf path\to\AirVPN.conf
 ```
+
+That installs the binaries to `C:\Program Files\vpnmgr`, copies the keys into
+`C:\ProgramData\vpnmgr` with inheritance stripped so only SYSTEM and
+administrators can read them, registers `vpnmgrd` to start at boot, and adds
+**VPN Manager** to the Start Menu. Re-run it without `-Conf` to update the
+binaries in place, keeping your configuration and keys.
+
+The Start Menu entry opens the tray, not a console. The service logs to
+`C:\ProgramData\vpnmgr-logs\vpnmgrd.log`, which is outside the key directory so
+it can be read without elevation.
 
 Config lives at `C:\ProgramData\vpnmgr\config.toml`, clients reach the daemon
 over `\\.\pipe\vpnmgr`, and the pipe admits administrators and interactive
